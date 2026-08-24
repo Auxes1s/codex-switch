@@ -1,0 +1,188 @@
+#!/bin/sh
+
+set -u
+
+usage() {
+    cat <<'EOF'
+Usage: codex-switch <profile>
+       codex-switch switch <profile>
+       codex-switch add <profile>
+       codex-switch auth <profile>
+       codex-switch remove <profile>
+       codex-switch list
+       codex-switch --help
+
+Manage saved Codex authentication profiles. The one-argument form is shorthand
+for "codex-switch switch <profile>".
+EOF
+}
+
+fail() {
+    printf 'codex-switch: %s\n' "$1" >&2
+    exit "${2-1}"
+}
+
+valid_profile_name() {
+    case $1 in
+        ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*|add|auth|help|list|remove|switch) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+require_profile_name() {
+    valid_profile_name "$1" || fail "invalid profile name: $1" 64
+}
+
+require_auth() {
+    if [ ! -f "$1" ] || [ ! -r "$1" ] || [ ! -s "$1" ]; then
+        fail "credentials are missing, unreadable, or empty: $1"
+    fi
+}
+
+copy_atomically() {
+    source_file=$1
+    destination_file=$2
+    destination_dir=${destination_file%/*}
+    destination_name=${destination_file##*/}
+    copy_tmp=$(mktemp "${destination_dir}/.${destination_name}.codex-switch.XXXXXX") ||
+        fail "could not create a temporary file in ${destination_dir}"
+    if ! cp "$source_file" "$copy_tmp" || ! chmod 600 "$copy_tmp" ||
+       ! mv -f "$copy_tmp" "$destination_file"; then
+        rm -f "$copy_tmp"
+        copy_tmp=
+        fail "could not update ${destination_file}"
+    fi
+    copy_tmp=
+}
+
+write_marker() {
+    marker_value=$1
+    marker_tmp=$(mktemp "${active_home}/..codex-switch-active.XXXXXX") ||
+        fail "could not create a temporary marker in ${active_home}"
+    if ! printf '%s\n' "$marker_value" > "$marker_tmp" ||
+       ! chmod 600 "$marker_tmp" || ! mv -f "$marker_tmp" "$active_marker"; then
+        rm -f "$marker_tmp"
+        marker_tmp=
+        fail 'could not update the active-profile marker'
+    fi
+    marker_tmp=
+}
+
+case "${1-}" in
+    -h|--help|help)
+        [ "$#" -eq 1 ] || { usage >&2; exit 64; }
+        usage
+        exit 0
+        ;;
+esac
+
+if [ "$#" -eq 0 ]; then
+    printf '%s\n\n' 'codex-switch: a command or profile is required' >&2
+    usage >&2
+    exit 64
+fi
+
+case ${HOME-} in
+    /*) ;;
+    *) fail 'HOME must be set to an absolute path' ;;
+esac
+
+active_home="${HOME}/.codex"
+active_auth="${active_home}/auth.json"
+active_marker="${active_home}/.codex-switch-active"
+copy_tmp=
+marker_tmp=
+cleanup() {
+    [ -z "$copy_tmp" ] || rm -f "$copy_tmp"
+    [ -z "$marker_tmp" ] || rm -f "$marker_tmp"
+}
+trap 'cleanup' EXIT HUP INT TERM
+
+active_profile=
+if [ -f "$active_marker" ] && IFS= read -r marker_profile < "$active_marker" &&
+   valid_profile_name "$marker_profile"; then
+    active_profile=$marker_profile
+fi
+
+command=$1
+case $command in
+    add|auth|remove|switch)
+        [ "$#" -eq 2 ] || fail "${command} requires exactly one profile" 64
+        profile=$2
+        require_profile_name "$profile"
+        ;;
+    list)
+        [ "$#" -eq 1 ] || fail 'list does not accept arguments' 64
+        ;;
+    *)
+        [ "$#" -eq 1 ] || fail 'expected exactly one profile argument' 64
+        command=switch
+        profile=$1
+        require_profile_name "$profile"
+        ;;
+esac
+
+umask 077
+
+if [ "$command" = list ]; then
+    for profile_dir in "${HOME}"/.codex-*; do
+        [ -d "$profile_dir" ] || continue
+        profile=${profile_dir##*/.codex-}
+        valid_profile_name "$profile" || continue
+        [ -f "$profile_dir/auth.json" ] && [ -r "$profile_dir/auth.json" ] &&
+            [ -s "$profile_dir/auth.json" ] || continue
+        if [ "$profile" = "$active_profile" ]; then
+            printf '%s\t(active)\n' "$profile"
+        else
+            printf '%s\n' "$profile"
+        fi
+    done | sort
+    exit 0
+fi
+
+profile_home="${HOME}/.codex-${profile}"
+profile_auth="${profile_home}/auth.json"
+
+case $command in
+    add)
+        require_auth "$active_auth"
+        [ ! -e "$profile_home" ] || fail "profile already exists: ${profile}"
+        mkdir "$profile_home" || fail "could not create profile: ${profile}"
+        copy_atomically "$active_auth" "$profile_auth"
+        mkdir -p "$active_home" || fail "could not create Codex home: ${active_home}"
+        write_marker "$profile"
+        printf 'Added and activated Codex profile: %s\n' "$profile"
+        ;;
+    auth)
+        require_auth "$profile_auth"
+        require_auth "$active_auth"
+        copy_atomically "$active_auth" "$profile_auth"
+        write_marker "$profile"
+        printf 'Updated auth for Codex profile: %s\n' "$profile"
+        ;;
+    remove)
+        require_auth "$profile_auth"
+        [ "$profile" != "$active_profile" ] || fail "cannot remove active profile: ${profile}"
+        rm -f "$profile_auth" || fail "could not remove credentials for ${profile}"
+        rmdir "$profile_home" 2>/dev/null || :
+        printf 'Removed Codex profile: %s\n' "$profile"
+        ;;
+    switch)
+        require_auth "$profile_auth"
+        mkdir -p "$active_home" || fail "could not create Codex home: ${active_home}"
+        if [ "$active_profile" = "$profile" ] && [ -f "$active_auth" ]; then
+            copy_atomically "$active_auth" "$profile_auth"
+            printf 'Active Codex profile: %s\n' "$profile"
+            exit 0
+        fi
+        if [ -n "$active_profile" ] && [ -f "$active_auth" ]; then
+            previous_home="${HOME}/.codex-${active_profile}"
+            if [ -d "$previous_home" ]; then
+                copy_atomically "$active_auth" "${previous_home}/auth.json"
+            fi
+        fi
+        copy_atomically "$profile_auth" "$active_auth"
+        write_marker "$profile"
+        printf 'Active Codex profile: %s\n' "$profile"
+        ;;
+esac
