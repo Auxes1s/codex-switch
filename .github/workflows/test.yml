@@ -1,0 +1,42 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unix:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run POSIX shell tests
+        run: ./tests/codex-switch.test.sh
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests with Windows PowerShell 5.1
+        shell: powershell
+        run: .\tests\codex-switch.test.ps1
+      - name: Run tests with PowerShell 7
+        shell: pwsh
+        run: .\tests\codex-switch.test.ps1
+      - name: Verify user PATH installation
+        shell: powershell
+        run: |
+          $originalPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          try {
+            $env:CODEX_SWITCH_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'codex-switch-path-test'
+            .\install.ps1
+            $updatedPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+            if (($updatedPath -split ';') -notcontains $env:CODEX_SWITCH_INSTALL_DIR) {
+              throw 'The installer did not add its directory to the user PATH.'
+            }
+          }
+          finally {
+            [Environment]::SetEnvironmentVariable('Path', $originalPath, 'User')
+          }
