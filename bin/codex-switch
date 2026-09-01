@@ -1,0 +1,280 @@
+#!/bin/sh
+
+set -u
+
+usage() {
+    cat <<'EOF'
+Usage: codex-switch <profile>
+       codex-switch switch <profile>
+       codex-switch run [<profile>] [--] [codex arguments...]
+       codex-switch add <profile>
+       codex-switch login <profile> [codex login arguments...]
+       codex-switch auth <profile> [codex login arguments...]
+       codex-switch logout <profile>
+       codex-switch status [<profile>]
+       codex-switch remove <profile>
+       codex-switch list
+       codex-switch current
+       codex-switch shell-init
+       codex-switch --help
+
+Manage isolated Codex authentication profiles. The one-argument form selects a
+profile. Run Codex safely with "codex-switch run", or evaluate the output of
+"codex-switch shell-init" so ordinary codex commands use the selected profile.
+EOF
+}
+
+fail() {
+    printf 'codex-switch: %s\n' "$1" >&2
+    exit "${2-1}"
+}
+
+valid_profile_name() {
+    case $1 in
+        ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*|add|auth|current|help|list|login|logout|remove|run|shell-init|status|switch) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+require_profile_name() {
+    valid_profile_name "$1" || fail "invalid profile name: $1" 64
+}
+
+require_profile() {
+    [ -d "$1" ] || fail "profile does not exist: $2"
+}
+
+require_auth() {
+    if [ ! -f "$1" ] || [ ! -r "$1" ] || [ ! -s "$1" ]; then
+        fail "profile is not signed in: $2 (run: codex-switch login $2)"
+    fi
+}
+
+write_marker() {
+    marker_value=$1
+    marker_tmp=$(mktemp "${active_home}/..codex-switch-active.XXXXXX") ||
+        fail "could not create a temporary marker in ${active_home}"
+    if ! printf '%s\n' "$marker_value" > "$marker_tmp" ||
+       ! chmod 600 "$marker_tmp" || ! mv -f "$marker_tmp" "$active_marker"; then
+        rm -f "$marker_tmp"
+        marker_tmp=
+        fail 'could not update the active-profile marker'
+    fi
+    marker_tmp=
+}
+
+link_shared_item() {
+    shared_name=$1
+    shared_source="${active_home}/${shared_name}"
+    shared_destination="${profile_home}/${shared_name}"
+
+    [ -e "$shared_source" ] || [ -L "$shared_source" ] || return 0
+    [ ! -e "$shared_destination" ] && [ ! -L "$shared_destination" ] || return 0
+    ln -s "$shared_source" "$shared_destination" ||
+        fail "could not share ${shared_name} with profile ${profile}"
+}
+
+prepare_profile_home() {
+    mkdir -p "$profile_home" || fail "could not create profile: ${profile}"
+
+    # Authentication and runtime state remain isolated. These read-mostly items
+    # are shared so profiles keep the user's normal configuration and extensions.
+    link_shared_item config.toml
+    link_shared_item skills
+    link_shared_item plugins
+    link_shared_item packages
+}
+
+remove_managed_link() {
+    managed_name=$1
+    managed_path="${profile_home}/${managed_name}"
+    managed_target="${active_home}/${managed_name}"
+    if [ -L "$managed_path" ] && [ "$(readlink "$managed_path" 2>/dev/null || :)" = "$managed_target" ]; then
+        rm -f "$managed_path" || fail "could not remove managed link: ${managed_path}"
+    fi
+}
+
+find_codex() {
+    codex_command=${CODEX_SWITCH_CODEX_BIN-codex}
+    [ -n "$codex_command" ] || fail 'CODEX_SWITCH_CODEX_BIN must not be empty'
+    command -v "$codex_command" >/dev/null 2>&1 ||
+        fail "could not find Codex executable: ${codex_command}"
+}
+
+exec_codex() {
+    find_codex
+    prepare_profile_home
+    CODEX_HOME=$profile_home
+    export CODEX_HOME
+
+    # File storage is intentional: auth.json is explicitly namespaced by
+    # CODEX_HOME. Each profile therefore owns one refresh-token cache.
+    exec "$codex_command" -c 'cli_auth_credentials_store="file"' "$@"
+}
+
+case "${1-}" in
+    -h|--help|help)
+        [ "$#" -eq 1 ] || { usage >&2; exit 64; }
+        usage
+        exit 0
+        ;;
+esac
+
+if [ "$#" -eq 0 ]; then
+    printf '%s\n\n' 'codex-switch: a command or profile is required' >&2
+    usage >&2
+    exit 64
+fi
+
+case ${HOME-} in
+    /*) ;;
+    *) fail 'HOME must be set to an absolute path' ;;
+esac
+
+active_home="${HOME}/.codex"
+active_marker="${active_home}/.codex-switch-active"
+marker_tmp=
+cleanup() {
+    [ -z "$marker_tmp" ] || rm -f "$marker_tmp"
+}
+trap 'cleanup' EXIT HUP INT TERM
+
+active_profile=
+if [ -f "$active_marker" ] && IFS= read -r marker_profile < "$active_marker" &&
+   valid_profile_name "$marker_profile"; then
+    active_profile=$marker_profile
+fi
+
+command_name=$1
+case $command_name in
+    add|logout|remove|switch)
+        [ "$#" -eq 2 ] || fail "${command_name} requires exactly one profile" 64
+        profile=$2
+        require_profile_name "$profile"
+        ;;
+    auth|login)
+        [ "$#" -ge 2 ] || fail "${command_name} requires a profile" 64
+        profile=$2
+        require_profile_name "$profile"
+        ;;
+    current|list|shell-init)
+        [ "$#" -eq 1 ] || fail "${command_name} does not accept arguments" 64
+        ;;
+    run)
+        ;;
+    status)
+        [ "$#" -le 2 ] || fail 'status accepts at most one profile' 64
+        ;;
+    *)
+        [ "$#" -eq 1 ] || fail 'expected exactly one profile argument' 64
+        command_name=switch
+        profile=$1
+        require_profile_name "$profile"
+        ;;
+esac
+
+umask 077
+mkdir -p "$active_home" || fail "could not create Codex home: ${active_home}"
+
+case $command_name in
+    current)
+        [ -n "$active_profile" ] || fail 'no active profile'
+        printf '%s\n' "$active_profile"
+        ;;
+    shell-init)
+        cat <<'EOF'
+# Route ordinary Codex CLI commands through the active codex-switch profile.
+codex() {
+    command codex-switch run -- "$@"
+}
+EOF
+        ;;
+    list)
+        for profile_dir in "${HOME}"/.codex-*; do
+            [ -d "$profile_dir" ] || continue
+            profile=${profile_dir##*/.codex-}
+            valid_profile_name "$profile" || continue
+            suffix=
+            if [ ! -f "$profile_dir/auth.json" ] || [ ! -r "$profile_dir/auth.json" ] ||
+               [ ! -s "$profile_dir/auth.json" ]; then
+                suffix='\t(signed out)'
+            fi
+            if [ "$profile" = "$active_profile" ]; then
+                suffix="${suffix}\t(active)"
+            fi
+            printf '%s%b\n' "$profile" "$suffix"
+        done | sort
+        ;;
+    add)
+        profile_home="${HOME}/.codex-${profile}"
+        [ ! -e "$profile_home" ] || fail "profile already exists: ${profile}"
+        prepare_profile_home
+        write_marker "$profile"
+        printf 'Added and selected Codex profile: %s\n' "$profile"
+        printf 'Sign in with: codex-switch login %s\n' "$profile"
+        ;;
+    auth|login)
+        shift 2
+        profile_home="${HOME}/.codex-${profile}"
+        if [ ! -d "$profile_home" ]; then
+            prepare_profile_home
+        fi
+        write_marker "$profile"
+        exec_codex login "$@"
+        ;;
+    logout)
+        profile_home="${HOME}/.codex-${profile}"
+        require_profile "$profile_home" "$profile"
+        exec_codex logout
+        ;;
+    remove)
+        profile_home="${HOME}/.codex-${profile}"
+        require_profile "$profile_home" "$profile"
+        [ "$profile" != "$active_profile" ] || fail "cannot remove active profile: ${profile}"
+        rm -f "$profile_home/auth.json" || fail "could not remove credentials for ${profile}"
+        remove_managed_link config.toml
+        remove_managed_link skills
+        remove_managed_link plugins
+        remove_managed_link packages
+        rmdir "$profile_home" 2>/dev/null || :
+        printf 'Removed Codex profile: %s\n' "$profile"
+        ;;
+    switch)
+        profile_home="${HOME}/.codex-${profile}"
+        require_profile "$profile_home" "$profile"
+        require_auth "${profile_home}/auth.json" "$profile"
+        prepare_profile_home
+        write_marker "$profile"
+        printf 'Selected Codex profile: %s\n' "$profile"
+        ;;
+    status)
+        if [ "$#" -eq 2 ]; then
+            profile=$2
+            require_profile_name "$profile"
+        else
+            [ -n "$active_profile" ] || fail 'no active profile'
+            profile=$active_profile
+        fi
+        profile_home="${HOME}/.codex-${profile}"
+        require_profile "$profile_home" "$profile"
+        exec_codex login status
+        ;;
+    run)
+        shift
+        if [ "${1-}" = -- ]; then
+            shift
+            [ -n "$active_profile" ] || fail 'no active profile; select one with: codex-switch <profile>'
+            profile=$active_profile
+        elif [ "$#" -gt 0 ] && valid_profile_name "$1" && [ -d "${HOME}/.codex-$1" ]; then
+            profile=$1
+            shift
+            write_marker "$profile"
+        else
+            [ -n "$active_profile" ] || fail 'run requires a profile when none is active' 64
+            profile=$active_profile
+        fi
+        profile_home="${HOME}/.codex-${profile}"
+        require_profile "$profile_home" "$profile"
+        exec_codex "$@"
+        ;;
+esac
