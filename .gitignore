@@ -1,1 +1,3 @@
 /codex-switch-windows-profiles*.zip
+__pycache__/
+*.pyc

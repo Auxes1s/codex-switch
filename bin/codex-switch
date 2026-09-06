@@ -2,6 +2,8 @@
 
 set -u
 
+script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
+
 usage() {
     cat <<'EOF'
 Usage: codex-switch <profile>
@@ -74,11 +76,164 @@ link_shared_item() {
         fail "could not share ${shared_name} with profile ${profile}"
 }
 
+shared_item_is_directory() {
+    case $1 in
+        sessions|archived_sessions|thread-writer-locks) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ensure_shared_item() {
+    shared_name=$1
+    shared_source="${active_home}/${shared_name}"
+
+    if [ -e "$shared_source" ] || [ -L "$shared_source" ]; then
+        return 0
+    fi
+
+    if shared_item_is_directory "$shared_name"; then
+        mkdir -p "$shared_source" || fail "could not create shared ${shared_name}"
+    else
+        : > "$shared_source" || fail "could not create shared ${shared_name}"
+        chmod 600 "$shared_source" || fail "could not protect shared ${shared_name}"
+    fi
+}
+
+merge_shared_tree() {
+    source_tree=$1
+    destination_tree=$2
+
+    mkdir -p "$destination_tree" || fail "could not create shared state directory: ${destination_tree}"
+    find "$source_tree" -type d -print | while IFS= read -r source_directory; do
+        relative_path=${source_directory#"${source_tree}"/}
+        [ "$relative_path" = "$source_directory" ] && relative_path=
+        if [ -n "$relative_path" ]; then
+            mkdir -p "${destination_tree}/${relative_path}" ||
+                fail "could not merge shared state directory: ${relative_path}"
+        fi
+    done
+    find "$source_tree" -type f -print | while IFS= read -r source_file; do
+        relative_path=${source_file#"${source_tree}"/}
+        destination_file="${destination_tree}/${relative_path}"
+        if { [ ! -e "$destination_file" ] && [ ! -L "$destination_file" ]; } ||
+           [ "$source_file" -nt "$destination_file" ]; then
+            mkdir -p "${destination_file%/*}" ||
+                fail "could not create shared state parent: ${destination_file%/*}"
+            cp -p "$source_file" "$destination_file" ||
+                fail "could not merge shared session: ${relative_path}"
+        fi
+    done
+}
+
+append_shared_file() {
+    source_file=$1
+    additional_file=$2
+    merged_file=$(mktemp "${active_home}/.codex-switch-shared.XXXXXX") ||
+        fail 'could not create a shared-state temporary file'
+    if ! cat "$source_file" "$additional_file" > "$merged_file" ||
+       ! chmod 600 "$merged_file" || ! mv -f "$merged_file" "$source_file"; then
+        rm -f "$merged_file"
+        fail "could not merge shared session history: ${source_file}"
+    fi
+}
+
+merge_profile_shared_item() {
+    profile_name=$1
+    shared_name=$2
+    shared_source="${active_home}/${shared_name}"
+    profile_item="${HOME}/.codex-${profile_name}/${shared_name}"
+
+    ensure_shared_item "$shared_name"
+    if [ -L "$profile_item" ] && [ "$(readlink "$profile_item" 2>/dev/null || :)" = "$shared_source" ]; then
+        return 0
+    fi
+
+    if [ -e "$profile_item" ] || [ -L "$profile_item" ]; then
+        legacy_item="${active_home}/.codex-switch-legacy-state/${profile_name}/${shared_name}"
+        mkdir -p "${legacy_item%/*}" || fail "could not create legacy state directory for ${profile_name}"
+        [ ! -e "$legacy_item" ] && [ ! -L "$legacy_item" ] ||
+            fail "legacy state already exists for ${profile_name}/${shared_name}; resolve it before retrying"
+        mv "$profile_item" "$legacy_item" ||
+            fail "could not preserve existing ${profile_name}/${shared_name} state"
+        if shared_item_is_directory "$shared_name"; then
+            merge_shared_tree "$legacy_item" "$shared_source"
+        elif [ -s "$legacy_item" ]; then
+            if [ ! -s "$shared_source" ]; then
+                cp -p "$legacy_item" "$shared_source" ||
+                    fail "could not preserve ${profile_name}/${shared_name} history"
+            else
+                append_shared_file "$shared_source" "$legacy_item"
+            fi
+        fi
+    fi
+
+    ln -s "$shared_source" "$profile_item" ||
+        fail "could not share ${shared_name} with profile ${profile_name}"
+}
+
+prepare_shared_profile_state() {
+    # Session transcripts and history are deliberately shared. Credentials and
+    # runtime databases are kept separate from profile-scoped CODEX_HOME auth.
+    for shared_name in sessions archived_sessions history.jsonl session_index.jsonl transcription-history.jsonl thread-writer-locks; do
+        ensure_shared_item "$shared_name"
+    done
+
+    for candidate_home in "${HOME}"/.codex-*; do
+        [ -d "$candidate_home" ] || continue
+        candidate_profile=${candidate_home##*/.codex-}
+        valid_profile_name "$candidate_profile" || continue
+        for shared_name in sessions archived_sessions history.jsonl session_index.jsonl transcription-history.jsonl thread-writer-locks; do
+            merge_profile_shared_item "$candidate_profile" "$shared_name"
+        done
+    done
+
+    # The current profile may not have existed when the loop above ran (login
+    # and add create it during the command), so make its links explicit.
+    for shared_name in sessions archived_sessions history.jsonl session_index.jsonl transcription-history.jsonl thread-writer-locks; do
+        merge_profile_shared_item "$profile" "$shared_name"
+    done
+}
+
+sqlite_migration_needed() {
+    for candidate_home in "${HOME}"/.codex-*; do
+        [ -d "$candidate_home" ] || continue
+        candidate_profile=${candidate_home##*/.codex-}
+        valid_profile_name "$candidate_profile" || continue
+        marker="${active_home}/.codex-switch-legacy-state/${candidate_profile}/sqlite/.merged-v1"
+        [ -f "$marker" ] && continue
+        for database_name in state_5.sqlite thread_history_1.sqlite goals_1.sqlite queue_1.sqlite memories_1.sqlite logs_2.sqlite; do
+            [ ! -f "${candidate_home}/${database_name}" ] || return 0
+        done
+    done
+    return 1
+}
+
+migrate_sqlite_state() {
+    sqlite_migration_needed || return 0
+    migration_helper=${CODEX_SWITCH_MIGRATION_HELPER-"${script_dir}/codex-switch-migrate.py"}
+    [ -f "$migration_helper" ] || fail "could not find SQLite migration helper: ${migration_helper}"
+
+    if [ -n "${CODEX_SWITCH_PYTHON-}" ]; then
+        python_command=$CODEX_SWITCH_PYTHON
+    elif command -v python3 >/dev/null 2>&1; then
+        python_command=python3
+    elif command -v python >/dev/null 2>&1; then
+        python_command=python
+    else
+        fail 'Python 3 is required once to merge existing profile session metadata'
+    fi
+    "$python_command" "$migration_helper" --active-home "$active_home" ||
+        fail 'legacy profile session metadata could not be migrated; close running Codex sessions and retry'
+}
+
 prepare_profile_home() {
     mkdir -p "$profile_home" || fail "could not create profile: ${profile}"
 
-    # Authentication and runtime state remain isolated. These read-mostly items
-    # are shared so profiles keep the user's normal configuration and extensions.
+    migrate_sqlite_state
+    prepare_shared_profile_state
+
+    # Authentication and SQLite/runtime state remain isolated. These read-mostly
+    # items are shared so profiles keep the user's normal configuration and extensions.
     link_shared_item config.toml
     link_shared_item skills
     link_shared_item plugins
@@ -94,6 +249,16 @@ remove_managed_link() {
     fi
 }
 
+remove_shared_managed_links() {
+    for shared_name in sessions archived_sessions history.jsonl session_index.jsonl transcription-history.jsonl thread-writer-locks; do
+        managed_path="${profile_home}/${shared_name}"
+        managed_target="${active_home}/${shared_name}"
+        if [ -L "$managed_path" ] && [ "$(readlink "$managed_path" 2>/dev/null || :)" = "$managed_target" ]; then
+            rm -f "$managed_path" || fail "could not remove managed link: ${managed_path}"
+        fi
+    done
+}
+
 find_codex() {
     codex_command=${CODEX_SWITCH_CODEX_BIN-codex}
     [ -n "$codex_command" ] || fail 'CODEX_SWITCH_CODEX_BIN must not be empty'
@@ -105,7 +270,9 @@ exec_codex() {
     find_codex
     prepare_profile_home
     CODEX_HOME=$profile_home
+    CODEX_SQLITE_HOME=$active_home
     export CODEX_HOME
+    export CODEX_SQLITE_HOME
 
     # File storage is intentional: auth.json is explicitly namespaced by
     # CODEX_HOME. Each profile therefore owns one refresh-token cache.
@@ -236,6 +403,7 @@ EOF
         remove_managed_link skills
         remove_managed_link plugins
         remove_managed_link packages
+        remove_shared_managed_links
         rmdir "$profile_home" 2>/dev/null || :
         printf 'Removed Codex profile: %s\n' "$profile"
         ;;

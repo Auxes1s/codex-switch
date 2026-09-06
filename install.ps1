@@ -34,7 +34,7 @@ try {
     $installDirectory = Get-NormalizedPath $installDirectory
     [void] [IO.Directory]::CreateDirectory($installDirectory)
 
-    foreach ($fileName in @('codex-switch.ps1', 'codex-switch.cmd')) {
+    foreach ($fileName in @('codex-switch.ps1', 'codex-switch.cmd', 'codex-switch-migrate.py')) {
         $source = Join-Path (Join-Path $PSScriptRoot 'bin') $fileName
         $destination = Join-Path $installDirectory $fileName
         $temporary = Join-Path $installDirectory ('.{0}.install.{1}.tmp' -f $fileName, [Guid]::NewGuid().ToString('N'))

@@ -19,14 +19,18 @@ fi
 umask 022
 mkdir -p "$install_dir"
 
-install_tmp="${install_dir}/.codex-switch.install.$$"
+install_tmp=
 cleanup() {
-    rm -f "$install_tmp"
+    [ -z "$install_tmp" ] || rm -f "$install_tmp"
 }
 trap 'cleanup' EXIT HUP INT TERM
 
-install -m 755 "${script_dir}/bin/codex-switch" "$install_tmp"
-mv -f "$install_tmp" "${install_dir}/codex-switch"
+for installed_name in codex-switch codex-switch-migrate.py; do
+    install_tmp="${install_dir}/.${installed_name}.install.$$"
+    install -m 755 "${script_dir}/bin/${installed_name}" "$install_tmp"
+    mv -f "$install_tmp" "${install_dir}/${installed_name}"
+    install_tmp=
+done
 
 printf 'Installed codex-switch to %s\n' "${install_dir}/codex-switch"
 printf '%s\n' 'For transparent profile routing, add this to your shell config:'

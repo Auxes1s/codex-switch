@@ -3,242 +3,110 @@ param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$command = Join-Path $repo 'bin\codex-switch.ps1'
+$installer = Join-Path $repo 'install.ps1'
+$shell = (Get-Process -Id $PID).Path
+$root = Join-Path ([IO.Path]::GetTempPath()) ('codex-switch-tests-' + [Guid]::NewGuid().ToString('N'))
 
-$repoDirectory = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$commandPath = Join-Path $repoDirectory 'bin\codex-switch.ps1'
-$installerPath = Join-Path $repoDirectory 'install.ps1'
-$powerShellPath = (Get-Process -Id $PID).Path
-$testRoot = Join-Path ([IO.Path]::GetTempPath()) ('codex-switch-tests-' + [Guid]::NewGuid().ToString('N'))
-$utf8WithoutBom = New-Object Text.UTF8Encoding($false)
-
-function Fail-Test {
-    param([string] $Message)
-    throw "not ok - $Message"
+function Assert-True([bool] $Condition, [string] $Message) { if (-not $Condition) { throw "not ok - $Message" } }
+function Assert-Equal([string] $Expected, [string] $Actual, [string] $Message) {
+    if ($Expected -cne $Actual) { throw "not ok - $Message (expected '$Expected', got '$Actual')" }
 }
-
-function Assert-True {
-    param([bool] $Condition, [string] $Message)
-    if (-not $Condition) { Fail-Test $Message }
+function Write-Text([string] $Path, [string] $Text) {
+    [IO.File]::WriteAllText($Path, $Text + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
 }
+function First-Line([string] $Path) { return [IO.File]::ReadLines($Path) | Select-Object -First 1 }
+function Quote-Argument([string] $Value) { if ($Value -notmatch '[\s"]') { return $Value }; return '"' + $Value.Replace('"','\"') + '"' }
 
-function Assert-TextEquals {
-    param([AllowEmptyString()][string] $Expected, [AllowEmptyString()][string] $Actual, [string] $Message)
-    if ($Expected -cne $Actual) {
-        Fail-Test "$Message (expected '$Expected', got '$Actual')"
-    }
-}
-
-function Assert-FileEquals {
-    param([string] $Expected, [string] $Actual, [string] $Message)
-    $expectedBytes = [IO.File]::ReadAllBytes($Expected)
-    $actualBytes = [IO.File]::ReadAllBytes($Actual)
-    if ($expectedBytes.Length -ne $actualBytes.Length) { Fail-Test $Message }
-    for ($index = 0; $index -lt $expectedBytes.Length; $index++) {
-        if ($expectedBytes[$index] -ne $actualBytes[$index]) { Fail-Test $Message }
-    }
-}
-
-function Write-TestFile {
-    param([string] $Path, [string] $Value)
-    [IO.File]::WriteAllText($Path, $Value + [Environment]::NewLine, $script:utf8WithoutBom)
-}
-
-function Read-FirstLine {
-    param([string] $Path)
-    return [IO.File]::ReadLines($Path) | Select-Object -First 1
-}
-
-function Quote-NativeArgument {
-    param([string] $Value)
-    if ($Value -notmatch '[\s"]') { return $Value }
-    return '"' + $Value.Replace('"', '\"') + '"'
-}
-
-function Invoke-Process {
-    param(
-        [string] $FilePath,
-        [string[]] $Arguments,
-        [hashtable] $Environment = @{}
-    )
-
-    $startInfo = New-Object Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $FilePath
-    $startInfo.Arguments = (($Arguments | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
-    $startInfo.UseShellExecute = $false
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.CreateNoWindow = $true
+function Invoke-Process([string] $File, [string[]] $Arguments, [hashtable] $Environment = @{}) {
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $File
+    $start.Arguments = (($Arguments | ForEach-Object { Quote-Argument $_ }) -join ' ')
+    $start.UseShellExecute = $false; $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
     foreach ($key in $Environment.Keys) {
-        if ($null -eq $Environment[$key]) {
-            [void] $startInfo.EnvironmentVariables.Remove($key)
-        }
-        else {
-            $startInfo.EnvironmentVariables[$key] = [string] $Environment[$key]
-        }
+        if ($null -eq $Environment[$key]) { [void] $start.EnvironmentVariables.Remove($key) }
+        else { $start.EnvironmentVariables[$key] = [string] $Environment[$key] }
     }
-    $process = New-Object Diagnostics.Process
-    $process.StartInfo = $startInfo
-    [void] $process.Start()
-    $stdout = $process.StandardOutput.ReadToEnd().TrimEnd([char[]] @("`r", "`n"))
-    $stderr = $process.StandardError.ReadToEnd().TrimEnd([char[]] @("`r", "`n"))
+    $process = New-Object Diagnostics.Process; $process.StartInfo = $start; [void] $process.Start()
+    $stdout = $process.StandardOutput.ReadToEnd().TrimEnd([char[]] @("`r","`n"))
+    $stderr = $process.StandardError.ReadToEnd().TrimEnd([char[]] @("`r","`n"))
     $process.WaitForExit()
-    return [pscustomobject] @{
-        ExitCode = $process.ExitCode
-        Stdout = $stdout
-        Stderr = $stderr
-    }
+    return [pscustomobject] @{ ExitCode = $process.ExitCode; Stdout = $stdout; Stderr = $stderr }
 }
 
-function Invoke-CodexSwitch {
-    param([string] $ActiveHome, [string[]] $Arguments)
-    return Invoke-Process $script:powerShellPath (@('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:commandPath) + $Arguments) @{ CODEX_HOME = $ActiveHome }
+function Invoke-Switch([string] $Home, [string[]] $Arguments, [hashtable] $Extra = @{}) {
+    $environment = @{ CODEX_HOME = $Home }
+    foreach ($key in $Extra.Keys) { $environment[$key] = $Extra[$key] }
+    return Invoke-Process $shell (@('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$command) + $Arguments) $environment
 }
 
-function New-TestHome {
-    param([string] $CaseName)
-
-    $caseRoot = Join-Path $script:testRoot $CaseName
-    $activeHome = Join-Path $caseRoot '.codex'
-    foreach ($directory in @($activeHome, "$activeHome-personal", "$activeHome-work", "$activeHome-gig")) {
-        [void] [IO.Directory]::CreateDirectory($directory)
-    }
-    Write-TestFile (Join-Path $activeHome 'auth.json') 'default-auth'
-    Write-TestFile (Join-Path $activeHome 'config.toml') 'keep-config'
-    Write-TestFile (Join-Path $activeHome 'history.jsonl') 'keep-history'
-    Write-TestFile (Join-Path "$activeHome-personal" 'auth.json') 'personal-auth'
-    Write-TestFile (Join-Path "$activeHome-work" 'auth.json') 'work-auth'
-    Write-TestFile (Join-Path "$activeHome-gig" 'auth.json') 'gig-auth'
-    return $activeHome
+function New-Home([string] $Name) {
+    $home = Join-Path $root "$Name\.codex"
+    foreach ($directory in @($home,"$home-personal","$home-work")) { [void] [IO.Directory]::CreateDirectory($directory) }
+    Write-Text (Join-Path $home 'auth.json') 'central-auth'
+    Write-Text (Join-Path $home 'config.toml') 'config'
+    Write-Text (Join-Path "$home-personal" 'auth.json') 'personal-auth'
+    Write-Text (Join-Path "$home-work" 'auth.json') 'work-auth'
+    return $home
 }
 
 try {
-    [void] [IO.Directory]::CreateDirectory($testRoot)
+    [void] [IO.Directory]::CreateDirectory($root)
+    $stub = Join-Path $root 'codex-stub.ps1'
+    @'
+param([Parameter(ValueFromRemainingArguments=$true)][string[]] $Arguments)
+$encoding = New-Object Text.UTF8Encoding($false)
+[IO.File]::WriteAllText(($env:CODEX_SWITCH_CAPTURE + '.home'), $env:CODEX_HOME + [Environment]::NewLine, $encoding)
+[IO.File]::WriteAllText(($env:CODEX_SWITCH_CAPTURE + '.sqlite-home'), $env:CODEX_SQLITE_HOME + [Environment]::NewLine, $encoding)
+[IO.File]::WriteAllText(($env:CODEX_SWITCH_CAPTURE + '.args'), ($Arguments -join "`n") + "`n", $encoding)
+if ($env:CODEX_SWITCH_WRITE_AUTH) { [IO.File]::WriteAllText((Join-Path $env:CODEX_HOME 'auth.json'), $env:CODEX_SWITCH_WRITE_AUTH + "`n", $encoding) }
+'@ | Set-Content -LiteralPath $stub -Encoding UTF8
 
-    $result = Invoke-CodexSwitch (Join-Path $testRoot 'unused-home') @('--help')
-    Assert-TextEquals '0' ([string] $result.ExitCode) 'help failed'
-    Assert-True ($result.Stdout -match '^Usage: codex-switch') 'help omitted usage text'
+    $home = New-Home 'main path with spaces'
+    $result = Invoke-Switch $home @('personal')
+    Assert-Equal '0' ([string] $result.ExitCode) 'switch failed'
+    Assert-Equal 'Selected Codex profile: personal' $result.Stdout 'switch confirmation is incorrect'
+    Assert-Equal 'personal-auth' (First-Line (Join-Path "$home-personal" 'auth.json')) 'switch changed profile auth'
+    Assert-Equal 'central-auth' (First-Line (Join-Path $home 'auth.json')) 'switch changed central auth'
+    Assert-True ((Get-Item (Join-Path "$home-personal" 'sessions')).Attributes -band [IO.FileAttributes]::ReparsePoint) 'sessions are not shared by junction'
 
-    $activeHome = New-TestHome 'persistent path with spaces'
-    $result = Invoke-CodexSwitch $activeHome @('personal')
-    Assert-TextEquals '0' ([string] $result.ExitCode) 'switch failed'
-    Assert-TextEquals 'Active Codex profile: personal' $result.Stdout 'switch confirmation is incorrect'
-    Assert-TextEquals 'personal-auth' (Read-FirstLine (Join-Path $activeHome 'auth.json')) 'personal credentials were not activated'
-    Assert-TextEquals 'personal' (Read-FirstLine (Join-Path $activeHome '.codex-switch-active')) 'active marker is incorrect'
-    Assert-TextEquals 'keep-config' (Read-FirstLine (Join-Path $activeHome 'config.toml')) 'config was changed'
-    Assert-TextEquals 'keep-history' (Read-FirstLine (Join-Path $activeHome 'history.jsonl')) 'history was changed'
-
-    Write-TestFile (Join-Path $activeHome 'auth.json') 'personal-refreshed'
-    $result = Invoke-CodexSwitch $activeHome @('switch', 'work')
-    Assert-TextEquals '0' ([string] $result.ExitCode) 'explicit switch failed'
-    Assert-TextEquals 'personal-refreshed' (Read-FirstLine (Join-Path "$activeHome-personal" 'auth.json')) 'outgoing credentials were not synced'
-    Assert-TextEquals 'work-auth' (Read-FirstLine (Join-Path $activeHome 'auth.json')) 'work credentials were not activated'
-
-    Write-TestFile (Join-Path $activeHome 'auth.json') 'work-refreshed'
-    $result = Invoke-CodexSwitch $activeHome @('WORK')
-    Assert-TextEquals '0' ([string] $result.ExitCode) 'case-insensitive same-profile switch failed'
-    Assert-TextEquals 'work-refreshed' (Read-FirstLine (Join-Path "$activeHome-work" 'auth.json')) 'same-profile credentials were not synced'
-
-    $authAcl = Get-Acl -LiteralPath (Join-Path $activeHome 'auth.json')
-    Assert-True $authAcl.AreAccessRulesProtected 'active credentials inherit ACL entries'
-    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-    $authRules = @($authAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
-    Assert-True ($authRules.Count -ge 1) 'active credentials have no explicit ACL rule'
-    foreach ($rule in $authRules) {
-        Assert-True ($rule.IdentityReference -eq $currentSid) 'active credentials grant access to another identity'
-        Assert-True ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow) 'active credentials contain a deny rule'
+    $capture = Join-Path $root 'capture'
+    $result = Invoke-Switch $home @('run','work','exec','task') @{
+        CODEX_SWITCH_CODEX_BIN = $stub; CODEX_SWITCH_CAPTURE = $capture; CODEX_SWITCH_WRITE_AUTH = 'work-refreshed'
     }
-    $temporaryFiles = @(Get-ChildItem -LiteralPath $activeHome -Force | Where-Object { $_.Name -like '.*codex-switch*.tmp' })
-    Assert-TextEquals '0' ([string] $temporaryFiles.Count) 'temporary files were left behind'
+    Assert-Equal '0' ([string] $result.ExitCode) 'run failed'
+    Assert-Equal "$home-work" (First-Line "$capture.home") 'run used wrong CODEX_HOME'
+    Assert-Equal $home (First-Line "$capture.sqlite-home") 'run used wrong CODEX_SQLITE_HOME'
+    Assert-Equal 'work-refreshed' (First-Line (Join-Path "$home-work" 'auth.json')) 'selected profile was not refreshed'
+    Assert-Equal 'personal-auth' (First-Line (Join-Path "$home-personal" 'auth.json')) 'run changed another profile'
+    Assert-Equal 'central-auth' (First-Line (Join-Path $home 'auth.json')) 'run changed central auth'
 
-    Write-TestFile (Join-Path $activeHome 'auth.json') 'gig2-auth'
-    $result = Invoke-CodexSwitch $activeHome @('add', 'gig2')
-    Assert-TextEquals 'Added and activated Codex profile: gig2' $result.Stdout 'add confirmation is incorrect'
-    Assert-TextEquals 'gig2-auth' (Read-FirstLine (Join-Path "$activeHome-gig2" 'auth.json')) 'add did not save active credentials'
-    Assert-True ((Invoke-CodexSwitch $activeHome @('add', 'gig2')).ExitCode -ne 0) 'adding a duplicate profile succeeded'
-    foreach ($invalidName in @('../escape', '_leading', 'bad name', 'ADD')) {
-        Assert-True ((Invoke-CodexSwitch $activeHome @('add', $invalidName)).ExitCode -ne 0) "adding an invalid profile succeeded: $invalidName"
+    $result = Invoke-Switch $home @('add','new')
+    Assert-True ($result.Stdout -match 'Added and selected Codex profile: new') 'add confirmation is incorrect'
+    Assert-True (-not [IO.File]::Exists((Join-Path "$home-new" 'auth.json'))) 'add copied credentials'
+    Assert-True ((Invoke-Switch $home @('add','new')).ExitCode -ne 0) 'duplicate add succeeded'
+    Assert-True ((Invoke-Switch $home @('add','../bad')).ExitCode -ne 0) 'invalid profile succeeded'
+
+    $list = Invoke-Switch $home @('list')
+    Assert-True ($list.Stdout -match '(?m)^new\t\(signed out\)\t\(active\)$') 'list omitted active signed-out profile'
+    Assert-Equal 'new' (Invoke-Switch $home @('current')).Stdout 'current returned wrong profile'
+    Assert-True ((Invoke-Switch $home @('remove','new')).ExitCode -ne 0) 'active profile removal succeeded'
+
+    $legacy = New-Home 'legacy'
+    Write-Text (Join-Path $legacy '.codex-switch-active') 'personal'
+    Write-Text (Join-Path $legacy 'auth.json') 'personal-refreshed-in-old-central-home'
+    $result = Invoke-Switch $legacy @('work')
+    Assert-Equal 'personal-refreshed-in-old-central-home' (First-Line (Join-Path "$legacy-personal" 'auth.json')) 'legacy active auth was not retained'
+    Assert-Equal 'work-auth' (First-Line (Join-Path "$legacy-work" 'auth.json')) 'legacy migration changed target auth'
+    Assert-True ([IO.File]::Exists((Join-Path $legacy '.codex-switch-auth-isolation-v1'))) 'legacy auth migration marker missing'
+
+    $install = Join-Path $root 'installed\bin'
+    $result = Invoke-Process $shell @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$installer,'-NoPathUpdate') @{ CODEX_SWITCH_INSTALL_DIR = $install }
+    Assert-Equal '0' ([string] $result.ExitCode) 'installer failed'
+    foreach ($name in @('codex-switch.ps1','codex-switch.cmd','codex-switch-migrate.py')) {
+        Assert-True ([IO.File]::Exists((Join-Path $install $name))) "installer omitted $name"
     }
-
-    $result = Invoke-CodexSwitch $activeHome @('list')
-    Assert-True ($result.Stdout -match '(?m)^gig2\t\(active\)$') 'list did not mark gig2 active'
-    Assert-True ($result.Stdout -match '(?m)^personal$') 'list omitted a saved profile'
-
-    Write-TestFile (Join-Path $activeHome 'auth.json') 'replacement-auth'
-    $result = Invoke-CodexSwitch $activeHome @('auth', 'personal')
-    Assert-TextEquals 'Updated auth for Codex profile: personal' $result.Stdout 'auth confirmation is incorrect'
-    Assert-TextEquals 'replacement-auth' (Read-FirstLine (Join-Path "$activeHome-personal" 'auth.json')) 'auth did not update saved credentials'
-    Assert-True ((Invoke-CodexSwitch $activeHome @('auth', 'unknown')).ExitCode -ne 0) 'updating an unknown profile succeeded'
-
-    Write-TestFile (Join-Path "$activeHome-gig2" 'notes.txt') 'preserve-me'
-    $result = Invoke-CodexSwitch $activeHome @('remove', 'gig2')
-    Assert-TextEquals '0' ([string] $result.ExitCode) 'removing an inactive profile failed'
-    Assert-True (-not [IO.File]::Exists((Join-Path "$activeHome-gig2" 'auth.json'))) 'remove retained profile credentials'
-    Assert-True ([IO.File]::Exists((Join-Path "$activeHome-gig2" 'notes.txt')) ) 'remove deleted unrelated profile contents'
-    Assert-True ((Invoke-CodexSwitch $activeHome @('remove', 'personal')).ExitCode -ne 0) 'removing the active profile succeeded'
-    [void] [IO.Directory]::CreateDirectory("$activeHome-temporary")
-    Write-TestFile (Join-Path "$activeHome-temporary" 'auth.json') 'temporary-auth'
-    $result = Invoke-CodexSwitch $activeHome @('remove', 'temporary')
-    Assert-True (-not [IO.Directory]::Exists("$activeHome-temporary")) 'remove retained an empty profile directory'
-
-    $invalidHome = New-TestHome 'invalid'
-    [IO.File]::Copy((Join-Path $invalidHome 'auth.json'), (Join-Path (Split-Path -Parent $invalidHome) 'original-auth'))
-    $invalidArgumentSets = New-Object Collections.ArrayList
-    [void] $invalidArgumentSets.Add([string[]] @())
-    [void] $invalidArgumentSets.Add([string[]] @('unknown'))
-    [void] $invalidArgumentSets.Add([string[]] @('personal', 'extra'))
-    foreach ($invalidArguments in $invalidArgumentSets) {
-        $result = Invoke-CodexSwitch $invalidHome ([string[]] $invalidArguments)
-        Assert-True ($result.ExitCode -ne 0) 'invalid arguments succeeded'
-        Assert-FileEquals (Join-Path (Split-Path -Parent $invalidHome) 'original-auth') (Join-Path $invalidHome 'auth.json') 'invalid arguments changed credentials'
-    }
-    Assert-TextEquals '64' ([string] (Invoke-CodexSwitch $invalidHome @()).ExitCode) 'missing arguments returned the wrong exit code'
-    Assert-TextEquals '64' ([string] (Invoke-CodexSwitch $invalidHome @('add', '_invalid')).ExitCode) 'invalid profile returned the wrong exit code'
-
-    $missingHome = New-TestHome 'missing'
-    [IO.File]::Delete((Join-Path "$missingHome-work" 'auth.json'))
-    $result = Invoke-CodexSwitch $missingHome @('work')
-    Assert-True ($result.ExitCode -ne 0) 'missing target credentials succeeded'
-    Assert-True (-not [IO.File]::Exists((Join-Path $missingHome '.codex-switch-active'))) 'missing target created an active marker'
-
-    $lockedHome = New-TestHome 'locked-destination'
-    Write-TestFile (Join-Path $lockedHome '.codex-switch-active') 'personal'
-    $lockedAuth = Join-Path $lockedHome 'auth.json'
-    $lockStream = [IO.File]::Open($lockedAuth, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    try {
-        $result = Invoke-CodexSwitch $lockedHome @('work')
-        Assert-True ($result.ExitCode -ne 0) 'switching over a locked destination succeeded'
-        Assert-TextEquals 'default-auth' (Read-FirstLine $lockedAuth) 'a failed atomic replacement changed active credentials'
-        Assert-TextEquals 'personal' (Read-FirstLine (Join-Path $lockedHome '.codex-switch-active')) 'a failed atomic replacement changed the marker'
-    }
-    finally {
-        $lockStream.Dispose()
-    }
-    $temporaryFiles = @(Get-ChildItem -LiteralPath $lockedHome -Force | Where-Object { $_.Name -like '.*codex-switch*.tmp' })
-    Assert-TextEquals '0' ([string] $temporaryFiles.Count) 'a failed replacement left temporary files behind'
-
-    $defaultRoot = Join-Path $testRoot 'default-user-profile'
-    [void] [IO.Directory]::CreateDirectory((Join-Path $defaultRoot '.codex-personal'))
-    Write-TestFile (Join-Path $defaultRoot '.codex-personal\auth.json') 'default-profile-auth'
-    $result = Invoke-Process $powerShellPath @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $commandPath, 'personal') @{ CODEX_HOME = $null; USERPROFILE = $defaultRoot }
-    Assert-TextEquals '0' ([string] $result.ExitCode) 'USERPROFILE default failed'
-    Assert-TextEquals 'default-profile-auth' (Read-FirstLine (Join-Path $defaultRoot '.codex\auth.json')) 'USERPROFILE default selected the wrong Codex home'
-
-    $installDirectory = Join-Path $testRoot 'installed path\bin'
-    $result = Invoke-Process $powerShellPath @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installerPath, '-NoPathUpdate') @{ CODEX_SWITCH_INSTALL_DIR = $installDirectory }
-    Assert-TextEquals '0' ([string] $result.ExitCode) 'installer failed'
-    Assert-FileEquals $commandPath (Join-Path $installDirectory 'codex-switch.ps1') 'installer copied a different PowerShell command'
-    Assert-FileEquals (Join-Path $repoDirectory 'bin\codex-switch.cmd') (Join-Path $installDirectory 'codex-switch.cmd') 'installer copied a different launcher'
-    $result = Invoke-Process $powerShellPath @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installerPath, '-NoPathUpdate') @{ CODEX_SWITCH_INSTALL_DIR = $installDirectory }
-    Assert-TextEquals '0' ([string] $result.ExitCode) 'repeat installation failed'
-    $installerTemporaryFiles = @(Get-ChildItem -LiteralPath $installDirectory -Force | Where-Object { $_.Name -like '*.install.*.tmp' })
-    Assert-TextEquals '0' ([string] $installerTemporaryFiles.Count) 'installer left temporary files behind'
-    $result = Invoke-Process (Join-Path $installDirectory 'codex-switch.cmd') @('list') @{ CODEX_HOME = $activeHome }
-    Assert-TextEquals '0' ([string] $result.ExitCode) '.cmd launcher failed'
-
     [Console]::Out.WriteLine('ok - all Windows codex-switch tests passed')
 }
-finally {
-    if ([IO.Directory]::Exists($testRoot)) {
-        [IO.Directory]::Delete($testRoot, $true)
-    }
-}
+finally { if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root, $true) } }

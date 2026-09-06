@@ -1,93 +1,50 @@
 [CmdletBinding()]
-param(
-    [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
-    [string[]] $CommandArguments
-)
+param([Parameter(Position = 0, ValueFromRemainingArguments = $true)][string[]] $CommandArguments)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:CopyTemp = $null
-$script:MarkerTemp = $null
-
 function Write-Usage {
-    param([switch] $ToError)
-
-    $text = @'
+@'
 Usage: codex-switch <profile>
        codex-switch switch <profile>
+       codex-switch run [<profile>] [--] [codex arguments...]
        codex-switch add <profile>
-       codex-switch auth <profile>
+       codex-switch login <profile> [codex login arguments...]
+       codex-switch auth <profile> [codex login arguments...]
+       codex-switch logout <profile>
+       codex-switch status [<profile>]
        codex-switch remove <profile>
        codex-switch list
+       codex-switch current
+       codex-switch shell-init
        codex-switch --help
-
-Manage saved Codex authentication profiles. The one-argument form is shorthand
-for "codex-switch switch <profile>".
 '@
-    if ($ToError) {
-        [Console]::Error.WriteLine($text)
-    }
-    else {
-        [Console]::Out.WriteLine($text)
-    }
 }
 
-function Stop-WithError {
-    param(
-        [Parameter(Mandatory = $true)][string] $Message,
-        [int] $ExitCode = 1
-    )
-
+function Stop-WithError([string] $Message, [int] $ExitCode = 1) {
     [Console]::Error.WriteLine('codex-switch: {0}', $Message)
     exit $ExitCode
 }
 
-function Test-ValidProfileName {
-    param([AllowNull()][AllowEmptyString()][string] $Name)
-
-    if ([string]::IsNullOrEmpty($Name) -or $Name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
-        return $false
-    }
-
-    return @('add', 'auth', 'help', 'list', 'remove', 'switch') -notcontains $Name
+function Test-ValidProfileName([AllowNull()][AllowEmptyString()][string] $Name) {
+    if ([string]::IsNullOrEmpty($Name) -or $Name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { return $false }
+    return @('add','auth','current','help','list','login','logout','remove','run','shell-init','status','switch') -notcontains $Name.ToLowerInvariant()
 }
 
-function Assert-ProfileName {
-    param([string] $Name)
-
-    if (-not (Test-ValidProfileName $Name)) {
-        Stop-WithError "invalid profile name: $Name" 64
-    }
+function Assert-ProfileName([string] $Name) {
+    if (-not (Test-ValidProfileName $Name)) { Stop-WithError "invalid profile name: $Name" 64 }
 }
 
-function Test-UsableAuth {
-    param([string] $Path)
-
-    try {
-        if (-not [IO.File]::Exists($Path) -or ([IO.FileInfo] $Path).Length -eq 0) {
-            return $false
-        }
-        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-        $stream.Dispose()
-        return $true
-    }
-    catch {
-        return $false
-    }
+function Test-UsableAuth([string] $Path) {
+    try { return [IO.File]::Exists($Path) -and ([IO.FileInfo] $Path).Length -gt 0 } catch { return $false }
 }
 
-function Assert-Auth {
-    param([string] $Path)
-
-    if (-not (Test-UsableAuth $Path)) {
-        Stop-WithError "credentials are missing, unreadable, or empty: $Path"
-    }
+function Assert-Auth([string] $Path, [string] $Profile) {
+    if (-not (Test-UsableAuth $Path)) { Stop-WithError "profile is not signed in: $Profile (run: codex-switch login $Profile)" }
 }
 
-function Set-SecureFileAcl {
-    param([string] $Path)
-
+function Set-SecureFileAcl([string] $Path) {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $acl = New-Object Security.AccessControl.FileSecurity
     $acl.SetOwner($identity.User)
@@ -101,260 +58,262 @@ function Set-SecureFileAcl {
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
-function New-TemporaryPath {
-    param(
-        [string] $Directory,
-        [string] $BaseName
-    )
-
-    do {
-        $candidate = Join-Path $Directory ('.{0}.codex-switch.{1}.tmp' -f $BaseName, [Guid]::NewGuid().ToString('N'))
-    } while ([IO.File]::Exists($candidate))
-    return $candidate
-}
-
-function Move-FileAtomically {
-    param(
-        [string] $TemporaryPath,
-        [string] $DestinationPath
-    )
-
-    if ([IO.File]::Exists($DestinationPath)) {
-        [IO.File]::Replace($TemporaryPath, $DestinationPath, $null)
-    }
-    else {
-        [IO.File]::Move($TemporaryPath, $DestinationPath)
-    }
-    Set-SecureFileAcl $DestinationPath
-}
-
-function Copy-FileAtomically {
-    param(
-        [string] $SourcePath,
-        [string] $DestinationPath
-    )
-
-    $destinationDirectory = Split-Path -Parent $DestinationPath
-    $destinationName = Split-Path -Leaf $DestinationPath
-    $script:CopyTemp = New-TemporaryPath $destinationDirectory $destinationName
+function Copy-FileAtomically([string] $Source, [string] $Destination) {
+    $temporary = "$Destination.codex-switch.$([Guid]::NewGuid().ToString('N')).tmp"
     try {
-        [IO.File]::Copy($SourcePath, $script:CopyTemp, $false)
-        Set-SecureFileAcl $script:CopyTemp
-        Move-FileAtomically $script:CopyTemp $DestinationPath
-        $script:CopyTemp = $null
+        [IO.File]::Copy($Source, $temporary, $false)
+        Set-SecureFileAcl $temporary
+        Move-Item -LiteralPath $temporary -Destination $Destination -Force
     }
-    catch {
-        if ($script:CopyTemp -and [IO.File]::Exists($script:CopyTemp)) {
-            [IO.File]::Delete($script:CopyTemp)
-        }
-        $script:CopyTemp = $null
-        throw (New-Object -TypeName IO.IOException -ArgumentList @("could not update $DestinationPath", $_.Exception))
-    }
+    finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
 }
 
-function Write-ActiveMarker {
-    param(
-        [string] $Value,
-        [string] $ActiveHome,
-        [string] $MarkerPath
-    )
-
-    $script:MarkerTemp = New-TemporaryPath $ActiveHome '.codex-switch-active'
+function Write-ActiveMarker([string] $Value) {
+    [void] [IO.Directory]::CreateDirectory($script:ActiveHome)
+    $temporary = "$script:ActiveMarker.codex-switch.$([Guid]::NewGuid().ToString('N')).tmp"
     try {
-        $utf8WithoutBom = New-Object Text.UTF8Encoding($false)
-        [IO.File]::WriteAllText($script:MarkerTemp, $Value + [Environment]::NewLine, $utf8WithoutBom)
-        Set-SecureFileAcl $script:MarkerTemp
-        Move-FileAtomically $script:MarkerTemp $MarkerPath
-        $script:MarkerTemp = $null
+        [IO.File]::WriteAllText($temporary, $Value + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+        Set-SecureFileAcl $temporary
+        Move-Item -LiteralPath $temporary -Destination $script:ActiveMarker -Force
     }
-    catch {
-        if ($script:MarkerTemp -and [IO.File]::Exists($script:MarkerTemp)) {
-            [IO.File]::Delete($script:MarkerTemp)
+    finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+}
+
+function Get-ProfileDirectories {
+    $parent = Split-Path -Parent $script:ActiveHome
+    $leaf = Split-Path -Leaf $script:ActiveHome
+    $prefix = $leaf + '-'
+    if (-not [IO.Directory]::Exists($parent)) { return @() }
+    return @(Get-ChildItem -LiteralPath $parent -Directory -Force | Where-Object {
+        $_.Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-ValidProfileName $_.Name.Substring($prefix.Length))
+    })
+}
+
+function Merge-Directory([string] $Source, [string] $Destination) {
+    if (-not [IO.Directory]::Exists($Source)) { return }
+    foreach ($file in Get-ChildItem -LiteralPath $Source -File -Recurse -Force) {
+        $relative = $file.FullName.Substring($Source.Length).TrimStart([char[]] @('\','/'))
+        $target = Join-Path $Destination $relative
+        [void] [IO.Directory]::CreateDirectory((Split-Path -Parent $target))
+        if (-not [IO.File]::Exists($target) -or $file.LastWriteTimeUtc -gt ([IO.FileInfo] $target).LastWriteTimeUtc) {
+            [IO.File]::Copy($file.FullName, $target, $true)
         }
-        $script:MarkerTemp = $null
-        throw (New-Object -TypeName IO.IOException -ArgumentList @('could not update the active-profile marker', $_.Exception))
     }
 }
 
-function Get-NormalizedDirectoryPath {
-    param([string] $Path)
-
-    $fullPath = [IO.Path]::GetFullPath($Path)
-    $root = [IO.Path]::GetPathRoot($fullPath)
-    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($fullPath, $root)) {
-        $fullPath = $fullPath.TrimEnd([char[]] @('\', '/'))
+function Add-DirectoryJunction([string] $Path, [string] $Target, [string] $Profile) {
+    if (Test-Path -LiteralPath $Path) {
+        $item = Get-Item -LiteralPath $Path -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            if (@($item.Target) -contains $Target) { return }
+            Stop-WithError "managed session path points somewhere unexpected: $Path"
+        }
+        $legacy = Join-Path $script:ActiveHome ".codex-switch-legacy-state\$Profile\$($item.Name)"
+        [void] [IO.Directory]::CreateDirectory((Split-Path -Parent $legacy))
+        Merge-Directory $Path $Target
+        if (-not (Test-Path -LiteralPath $legacy)) { Move-Item -LiteralPath $Path -Destination $legacy }
+        else { Remove-Item -LiteralPath $Path -Recurse }
     }
-    return $fullPath
+    [void] [IO.Directory]::CreateDirectory($Target)
+    [void] (New-Item -ItemType Junction -Path $Path -Target $Target)
 }
 
-function Test-SameProfile {
-    param([string] $Left, [string] $Right)
-    return [StringComparer]::OrdinalIgnoreCase.Equals($Left, $Right)
+function Add-SharedFile([string] $Path, [string] $Target, [string] $Profile) {
+    if (-not [IO.File]::Exists($Target)) {
+        [IO.File]::WriteAllText($Target, '', (New-Object Text.UTF8Encoding($false)))
+        Set-SecureFileAcl $Target
+    }
+    if (Test-Path -LiteralPath $Path) {
+        $item = Get-Item -LiteralPath $Path -Force
+        $linkType = $item.PSObject.Properties['LinkType']
+        if ($linkType -and @('HardLink','SymbolicLink') -contains $linkType.Value) { return }
+        $legacy = Join-Path $script:ActiveHome ".codex-switch-legacy-state\$Profile\$($item.Name)"
+        [void] [IO.Directory]::CreateDirectory((Split-Path -Parent $legacy))
+        $existing = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($line in [IO.File]::ReadLines($Target)) { [void] $existing.Add($line) }
+        $writer = [IO.File]::AppendText($Target)
+        try { foreach ($line in [IO.File]::ReadLines($Path)) { if ($existing.Add($line)) { $writer.WriteLine($line) } } }
+        finally { $writer.Dispose() }
+        if (-not (Test-Path -LiteralPath $legacy)) { Move-Item -LiteralPath $Path -Destination $legacy }
+        else { Remove-Item -LiteralPath $Path }
+    }
+    try { [void] (New-Item -ItemType HardLink -Path $Path -Target $Target) }
+    catch { [void] (New-Item -ItemType SymbolicLink -Path $Path -Target $Target) }
+}
+
+function Invoke-SqliteMigration {
+    $needed = $false
+    foreach ($directory in Get-ProfileDirectories) {
+        $profile = $directory.Name.Substring((Split-Path -Leaf $script:ActiveHome).Length + 1)
+        $marker = Join-Path $script:ActiveHome ".codex-switch-legacy-state\$profile\sqlite\.merged-v1"
+        if (Test-Path -LiteralPath $marker) { continue }
+        foreach ($name in @('state_5.sqlite','thread_history_1.sqlite','goals_1.sqlite','queue_1.sqlite','memories_1.sqlite','logs_2.sqlite')) {
+            if ([IO.File]::Exists((Join-Path $directory.FullName $name))) { $needed = $true; break }
+        }
+    }
+    if (-not $needed) { return }
+    $helper = if ($env:CODEX_SWITCH_MIGRATION_HELPER) { $env:CODEX_SWITCH_MIGRATION_HELPER } else { Join-Path $PSScriptRoot 'codex-switch-migrate.py' }
+    if (-not [IO.File]::Exists($helper)) { Stop-WithError "could not find SQLite migration helper: $helper" }
+    if ($env:CODEX_SWITCH_PYTHON) { $python = $env:CODEX_SWITCH_PYTHON; $prefix = @() }
+    elseif (Get-Command py -ErrorAction SilentlyContinue) { $python = 'py'; $prefix = @('-3') }
+    elseif (Get-Command python3 -ErrorAction SilentlyContinue) { $python = 'python3'; $prefix = @() }
+    elseif (Get-Command python -ErrorAction SilentlyContinue) { $python = 'python'; $prefix = @() }
+    else { Stop-WithError 'Python 3 is required once to merge existing profile session metadata' }
+    & $python @prefix $helper '--active-home' $script:ActiveHome
+    if ($LASTEXITCODE -ne 0) { Stop-WithError 'legacy profile session metadata could not be migrated; close running Codex sessions and retry' }
+}
+
+function Migrate-LegacyAuth {
+    $marker = Join-Path $script:ActiveHome '.codex-switch-auth-isolation-v1'
+    if ([IO.File]::Exists($marker)) { return }
+    if ($script:ActiveProfile) {
+        $centralAuth = Join-Path $script:ActiveHome 'auth.json'
+        $profileHome = "$($script:ActiveHome)-$($script:ActiveProfile)"
+        $profileAuth = Join-Path $profileHome 'auth.json'
+        $hasOldLayout =
+            -not (Test-Path -LiteralPath (Join-Path $profileHome 'sessions')) -and
+            -not (Test-Path -LiteralPath (Join-Path $profileHome 'config.toml'))
+        if ($hasOldLayout -and (Test-UsableAuth $centralAuth) -and [IO.Directory]::Exists($profileHome)) {
+            $backup = Join-Path $script:ActiveHome ".codex-switch-legacy-state\$($script:ActiveProfile)\auth.json.pre-isolation"
+            [void] [IO.Directory]::CreateDirectory((Split-Path -Parent $backup))
+            if ([IO.File]::Exists($profileAuth) -and -not [IO.File]::Exists($backup)) { Copy-FileAtomically $profileAuth $backup }
+            Copy-FileAtomically $centralAuth $profileAuth
+        }
+    }
+    [IO.File]::WriteAllText($marker, "complete`n", (New-Object Text.UTF8Encoding($false)))
+    Set-SecureFileAcl $marker
+}
+
+function Prepare-Profile([string] $Profile) {
+    $profileHome = "$($script:ActiveHome)-$Profile"
+    [void] [IO.Directory]::CreateDirectory($profileHome)
+    Invoke-SqliteMigration
+    foreach ($name in @('sessions','archived_sessions','thread-writer-locks')) {
+        Add-DirectoryJunction (Join-Path $profileHome $name) (Join-Path $script:ActiveHome $name) $Profile
+    }
+    foreach ($name in @('history.jsonl','session_index.jsonl','transcription-history.jsonl')) {
+        Add-SharedFile (Join-Path $profileHome $name) (Join-Path $script:ActiveHome $name) $Profile
+    }
+    foreach ($name in @('skills','plugins','packages')) {
+        $target = Join-Path $script:ActiveHome $name
+        if (Test-Path -LiteralPath $target) { Add-DirectoryJunction (Join-Path $profileHome $name) $target $Profile }
+    }
+    $config = Join-Path $script:ActiveHome 'config.toml'
+    if ([IO.File]::Exists($config) -and -not (Test-Path -LiteralPath (Join-Path $profileHome 'config.toml'))) {
+        try { [void] (New-Item -ItemType HardLink -Path (Join-Path $profileHome 'config.toml') -Target $config) }
+        catch { [void] (New-Item -ItemType SymbolicLink -Path (Join-Path $profileHome 'config.toml') -Target $config) }
+    }
+    return $profileHome
+}
+
+function Invoke-Codex([string] $Profile, [string[]] $Arguments) {
+    $profileHome = Prepare-Profile $Profile
+    $codex = if ($env:CODEX_SWITCH_CODEX_BIN) { $env:CODEX_SWITCH_CODEX_BIN } else { 'codex' }
+    if (-not (Get-Command $codex -ErrorAction SilentlyContinue)) { Stop-WithError "could not find Codex executable: $codex" }
+    $oldHome = $env:CODEX_HOME; $oldSqliteHome = $env:CODEX_SQLITE_HOME
+    try {
+        $env:CODEX_HOME = $profileHome
+        $env:CODEX_SQLITE_HOME = $script:ActiveHome
+        $global:LASTEXITCODE = 0
+        & $codex '-c' 'cli_auth_credentials_store="file"' @Arguments
+        exit $LASTEXITCODE
+    }
+    finally { $env:CODEX_HOME = $oldHome; $env:CODEX_SQLITE_HOME = $oldSqliteHome }
 }
 
 try {
     $arguments = @($CommandArguments)
-
-    if ($arguments.Count -eq 1 -and @('-h', '--help', 'help') -contains $arguments[0]) {
-        Write-Usage
-        exit 0
+    if ($arguments.Count -eq 1 -and @('-h','--help','help') -contains $arguments[0]) { Write-Usage; exit 0 }
+    if ($arguments.Count -eq 0) { Stop-WithError 'a command or profile is required' 64 }
+    $homeInput = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    if (-not [IO.Path]::IsPathRooted($homeInput)) { Stop-WithError 'CODEX_HOME or USERPROFILE must resolve to an absolute path' }
+    $script:ActiveHome = [IO.Path]::GetFullPath($homeInput).TrimEnd([char[]] @('\','/'))
+    [void] [IO.Directory]::CreateDirectory($script:ActiveHome)
+    $script:ActiveMarker = Join-Path $script:ActiveHome '.codex-switch-active'
+    $script:ActiveProfile = $null
+    if ([IO.File]::Exists($script:ActiveMarker)) {
+        $candidate = [IO.File]::ReadLines($script:ActiveMarker) | Select-Object -First 1
+        if (Test-ValidProfileName $candidate) { $script:ActiveProfile = $candidate }
     }
 
-    if ($arguments.Count -eq 0) {
-        [Console]::Error.WriteLine('codex-switch: a command or profile is required')
-        [Console]::Error.WriteLine()
-        Write-Usage -ToError
-        exit 64
+    $command = $arguments[0].ToLowerInvariant()
+    if (@('add','logout','remove','switch') -contains $command) {
+        if ($arguments.Count -ne 2) { Stop-WithError "$command requires exactly one profile" 64 }
+        $profile = $arguments[1]; Assert-ProfileName $profile
+    } elseif (@('auth','login') -contains $command) {
+        if ($arguments.Count -lt 2) { Stop-WithError "$command requires a profile" 64 }
+        $profile = $arguments[1]; Assert-ProfileName $profile
+    } elseif (@('current','list','shell-init') -contains $command) {
+        if ($arguments.Count -ne 1) { Stop-WithError "$command does not accept arguments" 64 }
+    } elseif ($command -eq 'status') {
+        if ($arguments.Count -gt 2) { Stop-WithError 'status accepts at most one profile' 64 }
+    } elseif ($command -ne 'run') {
+        if ($arguments.Count -ne 1) { Stop-WithError 'expected exactly one profile argument' 64 }
+        $profile = $arguments[0]; Assert-ProfileName $profile; $command = 'switch'
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
-        $activeHomeInput = $env:CODEX_HOME
-    }
-    else {
-        $activeHomeInput = $env:USERPROFILE
-        if ([string]::IsNullOrWhiteSpace($activeHomeInput)) {
-            Stop-WithError 'USERPROFILE must be set to an absolute path'
-        }
-        $activeHomeInput = Join-Path $activeHomeInput '.codex'
-    }
-
-    if (-not [IO.Path]::IsPathRooted($activeHomeInput)) {
-        Stop-WithError 'CODEX_HOME or USERPROFILE must resolve to an absolute path'
-    }
-
-    $activeHome = Get-NormalizedDirectoryPath $activeHomeInput
-    $activeAuth = Join-Path $activeHome 'auth.json'
-    $activeMarker = Join-Path $activeHome '.codex-switch-active'
-
-    $activeProfile = $null
-    if ([IO.File]::Exists($activeMarker)) {
-        try {
-            $markerProfile = [IO.File]::ReadLines($activeMarker) | Select-Object -First 1
-            if (Test-ValidProfileName $markerProfile) {
-                $activeProfile = $markerProfile
-            }
-        }
-        catch {
-            $activeProfile = $null
-        }
-    }
-
-    $command = $arguments[0]
-    if (@('add', 'auth', 'remove', 'switch') -contains $command) {
-        if ($arguments.Count -ne 2) {
-            Stop-WithError "$command requires exactly one profile" 64
-        }
-        $profile = $arguments[1]
-        Assert-ProfileName $profile
-        $command = $command.ToLowerInvariant()
-    }
-    elseif ($command -ieq 'list') {
-        if ($arguments.Count -ne 1) {
-            Stop-WithError 'list does not accept arguments' 64
-        }
-        $command = 'list'
-    }
-    else {
-        if ($arguments.Count -ne 1) {
-            Stop-WithError 'expected exactly one profile argument' 64
-        }
-        $command = 'switch'
-        $profile = $arguments[0]
-        Assert-ProfileName $profile
-    }
-
-    if ($command -eq 'list') {
-        $profileParent = Split-Path -Parent $activeHome
-        $profilePrefix = (Split-Path -Leaf $activeHome) + '-'
-        $profiles = @()
-        if ([IO.Directory]::Exists($profileParent)) {
-            foreach ($profileDirectory in Get-ChildItem -LiteralPath $profileParent -Directory -Force) {
-                if (-not $profileDirectory.Name.StartsWith($profilePrefix, [StringComparison]::OrdinalIgnoreCase)) {
-                    continue
-                }
-                $candidateProfile = $profileDirectory.Name.Substring($profilePrefix.Length)
-                $candidateAuth = Join-Path $profileDirectory.FullName 'auth.json'
-                if ((Test-ValidProfileName $candidateProfile) -and (Test-UsableAuth $candidateAuth)) {
-                    $profiles += $candidateProfile
-                }
-            }
-        }
-
-        foreach ($savedProfile in $profiles | Sort-Object) {
-            if ($activeProfile -and (Test-SameProfile $savedProfile $activeProfile)) {
-                [Console]::Out.WriteLine("{0}`t(active)", $savedProfile)
-            }
-            else {
-                [Console]::Out.WriteLine($savedProfile)
-            }
-        }
-        exit 0
-    }
-
-    $profileHome = "$activeHome-$profile"
-    $profileAuth = Join-Path $profileHome 'auth.json'
-
+    if (@('add','auth','login','logout','remove','run','status','switch') -contains $command) { Migrate-LegacyAuth }
     switch ($command) {
-        'add' {
-            Assert-Auth $activeAuth
-            if (Test-Path -LiteralPath $profileHome) {
-                Stop-WithError "profile already exists: $profile"
-            }
-            [void] [IO.Directory]::CreateDirectory($profileHome)
-            Copy-FileAtomically $activeAuth $profileAuth
-            [void] [IO.Directory]::CreateDirectory($activeHome)
-            Write-ActiveMarker $profile $activeHome $activeMarker
-            [Console]::Out.WriteLine('Added and activated Codex profile: {0}', $profile)
+        'current' { if (-not $script:ActiveProfile) { Stop-WithError 'no active profile' }; $script:ActiveProfile; break }
+        'shell-init' { 'function global:codex { codex-switch run -- @args }'; break }
+        'list' {
+            foreach ($directory in Get-ProfileDirectories) {
+                $name = $directory.Name.Substring((Split-Path -Leaf $script:ActiveHome).Length + 1)
+                $suffix = if (-not (Test-UsableAuth (Join-Path $directory.FullName 'auth.json'))) { "`t(signed out)" } else { '' }
+                if ($script:ActiveProfile -and $name -ieq $script:ActiveProfile) { $suffix += "`t(active)" }
+                "$name$suffix"
+            }; break
         }
-        'auth' {
-            Assert-Auth $profileAuth
-            Assert-Auth $activeAuth
-            Copy-FileAtomically $activeAuth $profileAuth
-            Write-ActiveMarker $profile $activeHome $activeMarker
-            [Console]::Out.WriteLine('Updated auth for Codex profile: {0}', $profile)
+        'add' {
+            $profileHome = "$($script:ActiveHome)-$profile"
+            if (Test-Path -LiteralPath $profileHome) { Stop-WithError "profile already exists: $profile" }
+            [void] (Prepare-Profile $profile); Write-ActiveMarker $profile
+            "Added and selected Codex profile: $profile"; "Sign in with: codex-switch login $profile"; break
+        }
+        { $_ -in @('auth','login') } {
+            [void] (Prepare-Profile $profile); Write-ActiveMarker $profile
+            $loginArguments = @('login')
+            if ($arguments.Count -gt 2) { $loginArguments += @($arguments | Select-Object -Skip 2) }
+            Invoke-Codex $profile $loginArguments
+        }
+        'logout' {
+            $profileHome = "$($script:ActiveHome)-$profile"
+            if (-not [IO.Directory]::Exists($profileHome)) { Stop-WithError "profile does not exist: $profile" }
+            Invoke-Codex $profile @('logout')
         }
         'remove' {
-            Assert-Auth $profileAuth
-            if ($activeProfile -and (Test-SameProfile $profile $activeProfile)) {
-                Stop-WithError "cannot remove active profile: $profile"
+            $profileHome = "$($script:ActiveHome)-$profile"
+            if (-not [IO.Directory]::Exists($profileHome)) { Stop-WithError "profile does not exist: $profile" }
+            if ($script:ActiveProfile -and $profile -ieq $script:ActiveProfile) { Stop-WithError "cannot remove active profile: $profile" }
+            $auth = Join-Path $profileHome 'auth.json'; if ([IO.File]::Exists($auth)) { [IO.File]::Delete($auth) }
+            foreach ($name in @('config.toml','skills','plugins','packages','sessions','archived_sessions','thread-writer-locks','history.jsonl','session_index.jsonl','transcription-history.jsonl')) {
+                $path = Join-Path $profileHome $name; if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
             }
-            [IO.File]::Delete($profileAuth)
-            try {
-                [IO.Directory]::Delete($profileHome, $false)
-            }
-            catch {
-                # Preserve non-empty profile directories and unrelated files.
-            }
-            [Console]::Out.WriteLine('Removed Codex profile: {0}', $profile)
+            try { [IO.Directory]::Delete($profileHome, $false) } catch { }
+            "Removed Codex profile: $profile"; break
         }
         'switch' {
-            Assert-Auth $profileAuth
-            [void] [IO.Directory]::CreateDirectory($activeHome)
-            if ($activeProfile -and (Test-SameProfile $activeProfile $profile) -and [IO.File]::Exists($activeAuth)) {
-                Copy-FileAtomically $activeAuth $profileAuth
-                [Console]::Out.WriteLine('Active Codex profile: {0}', $profile)
-                exit 0
-            }
-            if ($activeProfile -and [IO.File]::Exists($activeAuth)) {
-                $previousHome = "$activeHome-$activeProfile"
-                if ([IO.Directory]::Exists($previousHome)) {
-                    Copy-FileAtomically $activeAuth (Join-Path $previousHome 'auth.json')
-                }
-            }
-            Copy-FileAtomically $profileAuth $activeAuth
-            Write-ActiveMarker $profile $activeHome $activeMarker
-            [Console]::Out.WriteLine('Active Codex profile: {0}', $profile)
+            $profileHome = "$($script:ActiveHome)-$profile"
+            if (-not [IO.Directory]::Exists($profileHome)) { Stop-WithError "profile does not exist: $profile" }
+            Assert-Auth (Join-Path $profileHome 'auth.json') $profile
+            [void] (Prepare-Profile $profile); Write-ActiveMarker $profile
+            "Selected Codex profile: $profile"; break
+        }
+        'status' {
+            $profile = if ($arguments.Count -eq 2) { $arguments[1] } else { $script:ActiveProfile }
+            if (-not $profile) { Stop-WithError 'no active profile' }
+            Assert-ProfileName $profile; Invoke-Codex $profile @('login','status')
+        }
+        'run' {
+            $rest = @($arguments | Select-Object -Skip 1)
+            if ($rest.Count -gt 0 -and $rest[0] -eq '--') { $rest = @($rest | Select-Object -Skip 1); $profile = $script:ActiveProfile }
+            elseif ($rest.Count -gt 0 -and (Test-ValidProfileName $rest[0]) -and [IO.Directory]::Exists("$($script:ActiveHome)-$($rest[0])")) {
+                $profile = $rest[0]; $rest = @($rest | Select-Object -Skip 1); Write-ActiveMarker $profile
+            } else { $profile = $script:ActiveProfile }
+            if (-not $profile) { Stop-WithError 'run requires a profile when none is active' 64 }
+            Invoke-Codex $profile $rest
         }
     }
 }
-catch {
-    [Console]::Error.WriteLine('codex-switch: {0}', $_.Exception.Message)
-    exit 1
-}
-finally {
-    foreach ($temporaryPath in @($script:CopyTemp, $script:MarkerTemp)) {
-        if ($temporaryPath -and [IO.File]::Exists($temporaryPath)) {
-            try { [IO.File]::Delete($temporaryPath) } catch { }
-        }
-    }
-}
+catch { [Console]::Error.WriteLine('codex-switch: {0}', $_.Exception.Message); exit 1 }

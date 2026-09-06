@@ -46,6 +46,9 @@ new_home() {
         "$test_home/.codex-personal" \
         "$test_home/.codex-work" \
         "$test_home/.codex-gig" \
+        "$test_home/.codex/sessions/2026/01" \
+        "$test_home/.codex-personal/sessions/2026/02" \
+        "$test_home/.codex-work/sessions/2026/03" \
         "$test_home/.codex/skills" \
         "$test_home/.codex/plugins" \
         "$test_home/.codex/packages"
@@ -54,6 +57,12 @@ new_home() {
     printf '%s\n' 'personal-auth' > "$test_home/.codex-personal/auth.json"
     printf '%s\n' 'work-auth' > "$test_home/.codex-work/auth.json"
     printf '%s\n' 'gig-auth' > "$test_home/.codex-gig/auth.json"
+    printf '%s\n' 'central-session' > "$test_home/.codex/sessions/2026/01/central.jsonl"
+    printf '%s\n' 'personal-session' > "$test_home/.codex-personal/sessions/2026/02/personal.jsonl"
+    printf '%s\n' 'work-session' > "$test_home/.codex-work/sessions/2026/03/work.jsonl"
+    printf '%s\n' '{"id":"central-session","thread_name":"central","updated_at":"2026-01-01T00:00:00Z"}' > "$test_home/.codex/session_index.jsonl"
+    printf '%s\n' '{"id":"personal-session","thread_name":"personal","updated_at":"2026-02-01T00:00:00Z"}' > "$test_home/.codex-personal/session_index.jsonl"
+    printf '%s\n' '{"id":"work-session","thread_name":"work","updated_at":"2026-03-01T00:00:00Z"}' > "$test_home/.codex-work/session_index.jsonl"
 }
 
 codex_stub="${test_root}/codex-stub"
@@ -61,6 +70,7 @@ cat > "$codex_stub" <<'EOF'
 #!/bin/sh
 set -eu
 printf '%s\n' "$CODEX_HOME" > "${CODEX_SWITCH_CAPTURE}.home"
+printf '%s\n' "$CODEX_SQLITE_HOME" > "${CODEX_SWITCH_CAPTURE}.sqlite-home"
 printf '%s\n' "$@" > "${CODEX_SWITCH_CAPTURE}.args"
 if [ -n "${CODEX_SWITCH_WRITE_AUTH-}" ]; then
     printf '%s\n' "$CODEX_SWITCH_WRITE_AUTH" > "$CODEX_HOME/auth.json"
@@ -80,6 +90,10 @@ assert_file_equals "$test_home/central-auth-original" "$test_home/.codex/auth.js
 assert_file_equals "$test_home/personal-auth-original" "$test_home/.codex-personal/auth.json" 'switch changed profile credentials'
 assert_text_equals "$test_home/.codex/config.toml" "$(readlink "$test_home/.codex-personal/config.toml")" 'profile does not share config'
 assert_text_equals "$test_home/.codex/skills" "$(readlink "$test_home/.codex-personal/skills")" 'profile does not share skills'
+assert_text_equals "$test_home/.codex/sessions" "$(readlink "$test_home/.codex-personal/sessions")" 'profile does not share sessions'
+assert_file_equals "$test_home/.codex/.codex-switch-legacy-state/personal/sessions/2026/02/personal.jsonl" "$test_home/.codex/sessions/2026/02/personal.jsonl" 'personal session was not merged'
+grep -F 'personal-session' "$test_home/.codex/session_index.jsonl" >/dev/null || fail 'personal session index was not merged'
+assert_text_equals 'personal-auth' "$(sed -n '1p' "$test_home/.codex-personal/auth.json")" 'sharing sessions changed profile credentials'
 
 capture_base="${test_root}/run-work"
 output=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" \
@@ -87,6 +101,7 @@ output=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" \
     "$command_path" run work exec 'do the thing')
 assert_text_equals 'codex-stub-ok' "$output" 'run did not execute Codex'
 assert_text_equals "$test_home/.codex-work" "$(sed -n '1p' "${capture_base}.home")" 'run used the wrong CODEX_HOME'
+assert_text_equals "$test_home/.codex" "$(sed -n '1p' "${capture_base}.sqlite-home")" 'run used the wrong shared SQLite home'
 assert_arg '-c' 1 'run omitted the config override flag'
 assert_arg 'cli_auth_credentials_store="file"' 2 'run did not force file credential storage'
 assert_arg 'exec' 3 'run lost the Codex subcommand'
@@ -95,6 +110,8 @@ assert_text_equals 'work-refreshed' "$(sed -n '1p' "$test_home/.codex-work/auth.
 assert_file_equals "$test_home/central-auth-original" "$test_home/.codex/auth.json" 'run changed central credentials'
 assert_file_equals "$test_home/personal-auth-original" "$test_home/.codex-personal/auth.json" 'run changed another profile'
 assert_text_equals 'work' "$(sed -n '1p' "$test_home/.codex/.codex-switch-active")" 'explicit run did not select its profile'
+assert_text_equals "$test_home/.codex/sessions" "$(readlink "$test_home/.codex-work/sessions")" 'work profile does not share sessions'
+grep -F 'work-session' "$test_home/.codex/session_index.jsonl" >/dev/null || fail 'work session index was not merged'
 
 capture_base="${test_root}/run-active"
 HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" \
@@ -125,6 +142,7 @@ output=$(HOME="$test_home" "$command_path" add unsigned)
 printf '%s\n' "$output" | grep -F 'Added and selected Codex profile: unsigned' >/dev/null || fail 'add confirmation is incorrect'
 [ ! -e "$test_home/.codex-unsigned/auth.json" ] || fail 'add copied credentials into a new profile'
 assert_text_equals "$test_home/.codex/plugins" "$(readlink "$test_home/.codex-unsigned/plugins")" 'add did not share plugins'
+assert_text_equals "$test_home/.codex/sessions" "$(readlink "$test_home/.codex-unsigned/sessions")" 'add did not share sessions'
 
 if HOME="$test_home" "$command_path" add unsigned >/dev/null 2>&1; then
     fail 'adding a duplicate profile succeeded'
@@ -175,6 +193,9 @@ printf '%s\n' "$shell_init" | grep -F 'command codex-switch run -- "$@"' >/dev/n
 install_dir="${test_root}/installed/bin"
 CODEX_SWITCH_INSTALL_DIR="$install_dir" "$installer_path" >/dev/null
 assert_file_equals "$command_path" "$install_dir/codex-switch" 'installer copied different content'
+assert_file_equals "$repo_dir/bin/codex-switch-migrate.py" "$install_dir/codex-switch-migrate.py" 'installer omitted the migration helper'
 [ -x "$install_dir/codex-switch" ] || fail 'installed command is not executable'
+
+python3 "$repo_dir/tests/migration.test.py"
 
 printf '%s\n' 'ok - all codex-switch tests passed'

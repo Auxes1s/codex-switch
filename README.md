@@ -23,8 +23,19 @@ The new flow runs Codex with a profile-specific `CODEX_HOME` and forces
 
 Tokens are never copied during switching or normal use. Codex refreshes the one
 file belonging to the active profile. Configuration, skills, plugins, and the
-Codex package installation are shared from `~/.codex`; sessions and other runtime
-state remain isolated by profile.
+Codex package installation are shared from `~/.codex`. Session transcripts and
+history are also shared from `~/.codex` so every profile can browse and resume
+all local sessions. Codex's runtime databases use the shared
+`CODEX_SQLITE_HOME=~/.codex`, while credentials remain under the profile-specific
+`CODEX_HOME`.
+
+When shared session state is first enabled, existing profile session files are
+merged into `~/.codex`. Existing SQLite metadata—including titles, projects,
+goals, queues, and history—is also merged, preferring the newest conflicting
+record. The original profile files and database snapshots are preserved under
+`~/.codex/.codex-switch-legacy-state/` until you remove them yourself. Close
+running Codex sessions before this one-time migration. Python 3 is required for
+the migration only, not for normal profile use afterward.
 
 ## Set up profiles
 
@@ -88,6 +99,12 @@ codex exec "run the test suite"
 The shell integration affects the Codex CLI in that shell. The desktop app and IDE
 extension keep using their own standard `~/.codex` login.
 
+In PowerShell, add the equivalent wrapper to your profile:
+
+```powershell
+Invoke-Expression (codex-switch shell-init | Out-String)
+```
+
 ## Manage profiles
 
 ```sh
@@ -101,7 +118,8 @@ codex-switch remove client
 
 `add` creates an unsigned profile without cloning credentials. `remove` refuses to
 remove the active profile, deletes its credential file and links managed by this
-tool, and preserves unrelated files in the profile directory.
+tool, and preserves unrelated files in the profile directory. Removing a profile
+does not delete shared sessions.
 
 Do not commit, paste, or share any profile's `auth.json`; it contains access tokens.
 
@@ -114,8 +132,13 @@ Do not commit, paste, or share any profile's `auth.json`; it contains access tok
 This installs the command at `~/.local/bin/codex-switch`. Set
 `CODEX_SWITCH_INSTALL_DIR` to install into a different directory.
 
+On Windows, run `./install.ps1`; it installs the PowerShell launcher and migration
+helper under `%LOCALAPPDATA%\Programs\codex-switch\bin` by default.
+
 ## Test
 
 ```sh
 ./tests/codex-switch.test.sh
 ```
+
+Run `./tests/codex-switch.test.ps1` from PowerShell for the Windows suite.
