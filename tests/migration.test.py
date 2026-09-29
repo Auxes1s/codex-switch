@@ -46,6 +46,10 @@ def main() -> int:
         create_state(central / "state_5.sqlite", [
             ("shared", str(central / "sessions" / "shared.jsonl"), 100, "central title"),
         ])
+        connection = sqlite3.connect(central / "state_5.sqlite")
+        connection.execute("ALTER TABLE threads ADD COLUMN preview TEXT NOT NULL DEFAULT ''")
+        connection.commit()
+        connection.close()
         create_state(profile / "state_5.sqlite", [
             ("shared", str(profile / "sessions" / "shared.jsonl"), 200, "new title"),
             ("profile-only", str(profile / "sessions" / "only.jsonl"), 150, "profile title"),
@@ -100,6 +104,48 @@ def main() -> int:
             finally:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
                 lock_handle.close()
+
+    for conflict in ("unkeyed", "unique", "equal_timestamp", "missing_table"):
+        with tempfile.TemporaryDirectory(prefix="codex-switch-conflict-") as root_text:
+            root = Path(root_text)
+            central = root / ".codex"
+            profile = root / ".codex-work"
+            central.mkdir()
+            profile.mkdir()
+            create_state(central / "state_5.sqlite", [
+                ("central", str(central / "sessions" / "central.jsonl"), 100, "same title"),
+            ])
+            create_state(profile / "state_5.sqlite", [
+                (("central" if conflict == "equal_timestamp" else "profile"),
+                 str(profile / "sessions" / "profile.jsonl"),
+                 (100 if conflict == "equal_timestamp" else 200), "same title"),
+            ])
+            if conflict == "unkeyed":
+                for path in (central / "state_5.sqlite", profile / "state_5.sqlite"):
+                    connection = sqlite3.connect(path)
+                    connection.execute("CREATE TABLE unkeyed (value TEXT NOT NULL)")
+                    connection.execute("INSERT INTO unkeyed VALUES ('must not vanish')")
+                    connection.commit()
+                    connection.close()
+            elif conflict == "missing_table":
+                connection = sqlite3.connect(profile / "state_5.sqlite")
+                connection.execute("CREATE TABLE old_records (id TEXT PRIMARY KEY)")
+                connection.execute("INSERT INTO old_records VALUES ('must not vanish')")
+                connection.commit()
+                connection.close()
+            elif conflict == "unique":
+                connection = sqlite3.connect(central / "state_5.sqlite")
+                connection.execute("CREATE UNIQUE INDEX threads_title ON threads(title)")
+                connection.commit()
+                connection.close()
+            result = subprocess.run(
+                [sys.executable, str(helper), "--active-home", str(central)],
+                capture_output=True, text=True,
+            )
+            assert result.returncode != 0, conflict
+            assert "could not merge" in result.stderr, result.stderr
+            assert not (central / ".codex-switch-legacy-state" / "work" / "sqlite" / ".merged-v1").exists()
+            assert (profile / "state_5.sqlite").exists()
     print("ok - SQLite profile migration passed")
     return 0
 

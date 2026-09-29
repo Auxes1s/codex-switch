@@ -31,8 +31,9 @@ all local sessions. Codex's runtime databases use the shared
 
 When shared session state is first enabled, existing profile session files are
 merged into `~/.codex`. Existing SQLite metadata—including titles, projects,
-goals, queues, and history—is also merged, preferring the newest conflicting
-record. The original profile files and database snapshots are preserved under
+goals, queues, and history—is also merged. Records with the same primary key
+prefer the newer timestamp; unresolved conflicts stop the merge for review. The
+original profile files and database snapshots are preserved under
 `~/.codex/.codex-switch-legacy-state/` until you remove them yourself. Close
 running Codex sessions before this one-time migration. Python 3 is required for
 the migration only, not for normal profile use afterward.
@@ -63,6 +64,15 @@ codex-switch login work
 ```
 
 `auth` remains as an alias for `login`.
+On Windows, `login` authenticates in a secured staging home and publishes its
+credentials only after a successful login. To guard a profile by email domain:
+
+```powershell
+codex-switch login work --expect-domain example.com
+```
+
+The guard is checked by `switch`, `run`, and `status`. A failed publication
+restores the profile's previous credentials and selection.
 
 ## Use profiles
 
@@ -102,8 +112,12 @@ extension keep using their own standard `~/.codex` login.
 In PowerShell, add the equivalent wrapper to your profile:
 
 ```powershell
-Invoke-Expression (codex-switch shell-init | Out-String)
+Invoke-Expression (codex-switch.ps1 shell-init | Out-String)
 ```
+
+Windows `run` passes `--no-daemon` to avoid an unnecessary console process.
+If hooks cause a visible window on your setup, set
+`CODEX_SWITCH_DISABLE_HOOKS=1`; `run --with-hooks` overrides that setting.
 
 ## Manage profiles
 
@@ -133,12 +147,15 @@ This installs the command at `~/.local/bin/codex-switch`. Set
 `CODEX_SWITCH_INSTALL_DIR` to install into a different directory.
 
 On Windows, run `./install.ps1`; it installs the PowerShell launcher and migration
-helper under `%LOCALAPPDATA%\Programs\codex-switch\bin` by default.
+helper under `%LOCALAPPDATA%\Programs\codex-switch\bin` by default and adds that
+directory to your user `PATH`. Open a new shell after the first installation.
 
 ## Test
 
 ```sh
 ./tests/codex-switch.test.sh
+python3 ./tests/migration.test.py
 ```
 
-Run `./tests/codex-switch.test.ps1` from PowerShell for the Windows suite.
+From PowerShell, run `./tests/codex-switch.test.ps1` and
+`python ./tests/migration.test.py` for the Windows suites.

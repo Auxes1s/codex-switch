@@ -25,7 +25,7 @@ cleanup() {
 }
 trap 'cleanup' EXIT HUP INT TERM
 
-for installed_name in codex-switch codex-switch-migrate.py; do
+for installed_name in codex-switch-migrate.py codex-switch; do
     install_tmp="${install_dir}/.${installed_name}.install.$$"
     install -m 755 "${script_dir}/bin/${installed_name}" "$install_tmp"
     mv -f "$install_tmp" "${install_dir}/${installed_name}"

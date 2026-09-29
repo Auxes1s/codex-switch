@@ -25,6 +25,7 @@ RESERVED_PROFILES = {
     "run", "shell-init", "status", "switch",
 }
 SKIP_TABLES = {"_sqlx_migrations", "sqlite_sequence", "backfill_state",
+               "thread_history_projection_state",
                "rollout_migration_state", "rollout_migration_skipped_rollouts"}
 TIMESTAMP_COLUMNS = (
     "updated_at_ms", "updated_at", "updated_at_ordinal", "recency_at_ms", "generated_at",
@@ -88,28 +89,6 @@ def primary_key(connection: sqlite3.Connection, table: str) -> list[str]:
     return [row[1] for row in sorted(rows, key=lambda row: row[5]) if row[5]]
 
 
-def unique_keys(connection: sqlite3.Connection, table: str) -> list[list[str]]:
-    result = []
-    for index in connection.execute(f"PRAGMA index_list({quote(table)})").fetchall():
-        if not index[2] or index[3] == "pk":
-            continue
-        names = [row[2] for row in connection.execute(
-            f"PRAGMA index_info({quote(index[1])})"
-        ).fetchall()]
-        if names:
-            result.append(names)
-    return result
-
-
-def migration_signature(connection: sqlite3.Connection) -> list[tuple]:
-    if "_sqlx_migrations" not in tables(connection):
-        return []
-    return connection.execute(
-        "SELECT version, description, success, hex(checksum) "
-        "FROM _sqlx_migrations ORDER BY version"
-    ).fetchall()
-
-
 def row_timestamp(row: sqlite3.Row, names: list[str]) -> int:
     for candidate in TIMESTAMP_COLUMNS:
         if candidate in names and row[candidate] is not None:
@@ -140,26 +119,30 @@ def merge_logs(destination: sqlite3.Connection, source: sqlite3.Connection) -> N
 def merge_table(destination: sqlite3.Connection, source: sqlite3.Connection, table: str) -> None:
     destination_columns = columns(destination, table)
     source_columns = columns(source, table)
-    if destination_columns != source_columns:
-        raise RuntimeError(f"incompatible schema for table {table}")
+    if any(name not in destination_columns for name in source_columns):
+        raise RuntimeError(f"source has unknown columns for table {table}")
+    for column in destination.execute(f"PRAGMA table_info({quote(table)})"):
+        _, name, _, required, default, _ = column
+        if name not in source_columns and required and default is None:
+            raise RuntimeError(f"new required column {name} in table {table}")
     keys = primary_key(destination, table)
-    if not keys:
+    if not keys or any(name not in source_columns for name in keys):
+        if source.execute(f"SELECT 1 FROM {quote(table)} LIMIT 1").fetchone():
+            raise RuntimeError(f"cannot safely merge rows without a shared primary key in table {table}")
         return
 
     destination.row_factory = sqlite3.Row
     source.row_factory = sqlite3.Row
-    names_sql = ",".join(map(quote, destination_columns))
-    placeholders = ",".join("?" for _ in destination_columns)
+    names_sql = ",".join(map(quote, source_columns))
+    placeholders = ",".join("?" for _ in source_columns)
     where = " AND ".join(f"{quote(name)} IS ?" for name in keys)
     insert = f"INSERT INTO {quote(table)} ({names_sql}) VALUES ({placeholders})"
-    update_names = [name for name in destination_columns if name not in keys]
+    update_names = [name for name in source_columns if name not in keys]
     update = (
         f"UPDATE {quote(table)} SET "
         + ",".join(f"{quote(name)}=?" for name in update_names)
         + " WHERE " + where
     )
-    secondary_keys = unique_keys(destination, table)
-
     for source_row in source.execute(f"SELECT {names_sql} FROM {quote(table)}"):
         key_values = [source_row[name] for name in keys]
         current = destination.execute(
@@ -167,27 +150,20 @@ def merge_table(destination: sqlite3.Connection, source: sqlite3.Connection, tab
         ).fetchone()
         if current is None:
             try:
-                destination.execute(insert, [source_row[name] for name in destination_columns])
-            except sqlite3.IntegrityError:
-                # A secondary unique key already represents this logical record.
-                for unique_names in secondary_keys:
-                    unique_where = " AND ".join(f"{quote(name)} IS ?" for name in unique_names)
-                    values = [source_row[name] for name in unique_names]
-                    conflicting = destination.execute(
-                        f"SELECT {names_sql} FROM {quote(table)} WHERE {unique_where}", values
-                    ).fetchone()
-                    if conflicting is not None and row_timestamp(source_row, destination_columns) > row_timestamp(conflicting, destination_columns):
-                        destination.execute(f"DELETE FROM {quote(table)} WHERE {unique_where}", values)
-                        destination.execute(insert, [source_row[name] for name in destination_columns])
-                        break
-        elif row_timestamp(source_row, destination_columns) > row_timestamp(current, destination_columns):
+                destination.execute(insert, [source_row[name] for name in source_columns])
+            except sqlite3.IntegrityError as exc:
+                raise RuntimeError(f"conflicting unique key in table {table}") from exc
+        elif row_timestamp(source_row, source_columns) > row_timestamp(current, source_columns):
             try:
                 destination.execute(
                     update,
                     [source_row[name] for name in update_names] + key_values,
                 )
-            except sqlite3.IntegrityError:
-                continue
+            except sqlite3.IntegrityError as exc:
+                raise RuntimeError(f"conflicting update in table {table}") from exc
+        elif (row_timestamp(source_row, source_columns) == row_timestamp(current, source_columns)
+              and any(source_row[name] != current[name] for name in source_columns)):
+            raise RuntimeError(f"rows conflict at the same timestamp in table {table}")
 
 
 def backup_database(source_path: Path, backup_path: Path) -> None:
@@ -219,11 +195,14 @@ def merge_database(source_path: Path, destination_path: Path, active_home: Path,
     try:
         destination.execute("PRAGMA foreign_keys=OFF")
         destination.execute("PRAGMA busy_timeout=30000")
-        if migration_signature(source) != migration_signature(destination):
-            raise RuntimeError(f"incompatible Codex migrations in {source_path.name}")
+        # Codex adds columns between releases. Merge shared columns into the
+        # newer destination schema while preserving its migration ledger.
         with destination:
             destination_tables = set(tables(destination))
             source_tables = set(tables(source))
+            for table in sorted(source_tables - destination_tables - SKIP_TABLES):
+                if source.execute(f"SELECT 1 FROM {quote(table)} LIMIT 1").fetchone():
+                    raise RuntimeError(f"source table {table} has no destination table")
             for table in sorted(destination_tables & source_tables):
                 if table in SKIP_TABLES:
                     continue

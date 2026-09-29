@@ -34,17 +34,32 @@ try {
     $installDirectory = Get-NormalizedPath $installDirectory
     [void] [IO.Directory]::CreateDirectory($installDirectory)
 
-    foreach ($fileName in @('codex-switch.ps1', 'codex-switch.cmd', 'codex-switch-migrate.py')) {
+    $fileNames = @('codex-switch-migrate.py', 'codex-switch.ps1', 'codex-switch.cmd')
+    foreach ($fileName in $fileNames) {
+        if (-not [IO.File]::Exists((Join-Path (Join-Path $PSScriptRoot 'bin') $fileName))) {
+            throw "missing installation source: $fileName"
+        }
+    }
+    foreach ($fileName in $fileNames) {
         $source = Join-Path (Join-Path $PSScriptRoot 'bin') $fileName
         $destination = Join-Path $installDirectory $fileName
         $temporary = Join-Path $installDirectory ('.{0}.install.{1}.tmp' -f $fileName, [Guid]::NewGuid().ToString('N'))
+        $backup = Join-Path $installDirectory ('.{0}.install-backup.{1}.tmp' -f $fileName, [Guid]::NewGuid().ToString('N'))
         try {
             [IO.File]::Copy($source, $temporary, $false)
-            Move-Item -LiteralPath $temporary -Destination $destination -Force
+            if ([IO.File]::Exists($destination)) {
+                [IO.File]::Replace($temporary, $destination, $backup)
+            }
+            else {
+                [IO.File]::Move($temporary, $destination)
+            }
         }
         finally {
             if ([IO.File]::Exists($temporary)) {
                 [IO.File]::Delete($temporary)
+            }
+            if ([IO.File]::Exists($backup)) {
+                [IO.File]::Delete($backup)
             }
         }
     }

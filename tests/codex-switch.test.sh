@@ -1,6 +1,7 @@
 #!/bin/sh
 
 set -eu
+unset CODEX_HOME CODEX_SQLITE_HOME
 
 repo_dir=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
 command_path="${repo_dir}/bin/codex-switch"
@@ -72,6 +73,11 @@ set -eu
 printf '%s\n' "$CODEX_HOME" > "${CODEX_SWITCH_CAPTURE}.home"
 printf '%s\n' "$CODEX_SQLITE_HOME" > "${CODEX_SWITCH_CAPTURE}.sqlite-home"
 printf '%s\n' "$@" > "${CODEX_SWITCH_CAPTURE}.args"
+if [ "${OPENAI_API_KEY+x}${CODEX_ACCESS_TOKEN+x}${OPENAI_IDENTITY_TOKEN_FILE+x}${OPENAI_FEDERATION_RULE_ID+x}" ]; then
+    printf '%s\n' 'present' > "${CODEX_SWITCH_CAPTURE}.auth-env"
+else
+    printf '%s\n' 'absent' > "${CODEX_SWITCH_CAPTURE}.auth-env"
+fi
 if [ -n "${CODEX_SWITCH_WRITE_AUTH-}" ]; then
     printf '%s\n' "$CODEX_SWITCH_WRITE_AUTH" > "$CODEX_HOME/auth.json"
 fi
@@ -97,11 +103,12 @@ assert_text_equals 'personal-auth' "$(sed -n '1p' "$test_home/.codex-personal/au
 
 capture_base="${test_root}/run-work"
 output=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" \
-    CODEX_SWITCH_CAPTURE="$capture_base" CODEX_SWITCH_WRITE_AUTH='work-refreshed' \
+    CODEX_SWITCH_CAPTURE="$capture_base" CODEX_SWITCH_WRITE_AUTH='work-refreshed' OPENAI_API_KEY='test-key' \
     "$command_path" run work exec 'do the thing')
 assert_text_equals 'codex-stub-ok' "$output" 'run did not execute Codex'
 assert_text_equals "$test_home/.codex-work" "$(sed -n '1p' "${capture_base}.home")" 'run used the wrong CODEX_HOME'
 assert_text_equals "$test_home/.codex" "$(sed -n '1p' "${capture_base}.sqlite-home")" 'run used the wrong shared SQLite home'
+assert_text_equals 'absent' "$(sed -n '1p' "${capture_base}.auth-env")" 'run inherited an overriding auth variable'
 assert_arg '-c' 1 'run omitted the config override flag'
 assert_arg 'cli_auth_credentials_store="file"' 2 'run did not force file credential storage'
 assert_arg 'exec' 3 'run lost the Codex subcommand'
