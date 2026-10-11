@@ -36,15 +36,22 @@ for line in sys.stdin:
             result = {'id': 2, 'error': {'message': 'network unavailable'}}
         elif mode == 'healthy':
             result = {'id': 2, 'result': {'account': {'type': 'chatgpt', 'email': 'PRIVATE'}}}
+        elif mode in ('null-account', 'null-account-recovered'):
+            result = {'id': 2, 'result': {'account': None, 'requiresOpenaiAuth': True, 'workspaceRouting': None}}
+        elif mode == 'no-openai-auth':
+            result = {'id': 2, 'result': {'account': None, 'requiresOpenaiAuth': False}}
         else:
             result = {'id': 2, 'error': {'code': -32603, 'message': 'workspace routing discovery unauthorized (401)'}}
     else:
-        if mode == 'recovered':
+        if mode in ('recovered', 'null-account-recovered'):
             result = {'id': 3, 'result': {'account': {'type': 'chatgpt', 'access_token': 'SECRET'}}}
         else:
             print('unrelated log SECRET', file=sys.stderr, flush=True)
             if mode == 'revoked':
                 print('ERROR Failed to refresh token status=401 Unauthorized detail=TokenErrorDetail { error_code: Some("refresh_token_invalidated"), error_message: Some("Your session has ended. Please log in again."), .. }', file=sys.stderr, flush=True)
+            if mode == 'null-account':
+                print('2026-10-11T03:54:24Z ERROR codex_login::auth::manager: Failed to refresh token: Your access token could not be refreshed. Please log out and sign in again.', file=sys.stderr, flush=True)
+                print('ERROR Failed to refresh token: {"refresh_token": "SECRET"}', file=sys.stderr, flush=True)
             result = {'id': 3, 'result': {'account': None, 'requiresOpenaiAuth': True}}
     print(json.dumps(result), flush=True)
 '''
@@ -87,6 +94,28 @@ class DiagnosticsTests(unittest.TestCase):
     def test_healthy_or_recovered_auth_does_not_suggest_login(self):
         for mode in ['healthy', 'recovered', 'unrelated']:
             with self.subTest(mode=mode):
+                result = self.run_launcher(mode)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stderr, 'native stderr\n')
+
+    def test_null_account_with_saved_credentials_suggests_login(self):
+        (self.home / '.codex-gig' / 'auth.json').write_text('{"auth_mode":"chatgpt"}\n')
+        result = self.run_launcher('null-account')
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.startswith('native stderr\n'))
+        self.assertIn("profile 'gig'", result.stderr)
+        self.assertIn('Codex reports: Your access token could not be refreshed. Please log out and sign in again.', result.stderr)
+        self.assertIn('codex-switch login gig', result.stderr)
+        self.assertNotIn('SECRET', result.stderr)
+
+    def test_null_account_without_credentials_or_recovered_stays_silent(self):
+        for mode, saved in [('null-account', False), ('null-account-recovered', True), ('no-openai-auth', True)]:
+            with self.subTest(mode=mode, saved=saved):
+                auth = self.home / '.codex-gig' / 'auth.json'
+                if saved:
+                    auth.write_text('{"auth_mode":"chatgpt"}\n')
+                elif auth.exists():
+                    auth.unlink()
                 result = self.run_launcher(mode)
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual(result.stderr, 'native stderr\n')

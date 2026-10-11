@@ -247,7 +247,7 @@ function Invoke-SqliteMigration {
         $profile = $directory.Name.Substring((Split-Path -Leaf $script:ActiveHome).Length + 1)
         $marker = Join-Path $script:ActiveHome ".codex-switch-legacy-state\$profile\sqlite\.merged-v1"
         if (Test-Path -LiteralPath $marker) { continue }
-        foreach ($name in @('state_5.sqlite','thread_history_1.sqlite','goals_1.sqlite','queue_1.sqlite','memories_1.sqlite','logs_2.sqlite')) {
+        foreach ($name in @('state_5.sqlite','thread_history_1.sqlite','goals_1.sqlite','queue_1.sqlite','memories_1.sqlite','logs_2.sqlite','agent_message_board_1.sqlite')) {
             if ([IO.File]::Exists((Join-Path $directory.FullName $name))) { $needed = $true; break }
         }
     }

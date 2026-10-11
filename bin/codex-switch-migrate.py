@@ -19,6 +19,7 @@ DATABASES = (
     "queue_1.sqlite",
     "memories_1.sqlite",
     "logs_2.sqlite",
+    "agent_message_board_1.sqlite",
 )
 RESERVED_PROFILES = {
     "add", "auth", "current", "help", "list", "login", "logout", "remove",

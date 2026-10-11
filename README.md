@@ -30,7 +30,7 @@ all local sessions. Codex's runtime databases use the shared
 `CODEX_HOME`. Ambient credential variables (`OPENAI_API_KEY`, `CODEX_API_KEY`,
 `CODEX_ACCESS_TOKEN`, and workload-identity settings) are cleared before Codex
 starts so they cannot override the selected profile. Verified with Codex CLI
-0.162.1.
+0.162.1 (and 0.155.0).
 
 When shared session state is first enabled, existing profile session files are
 merged into `~/.codex`. Existing SQLite metadata—including titles, projects,

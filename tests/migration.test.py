@@ -78,6 +78,24 @@ def main() -> int:
         assert (central / "auth.json").read_text(encoding="utf-8") == "central-auth\n"
         assert (profile / "auth.json").read_text(encoding="utf-8") == "profile-auth\n"
 
+    # Codex 0.162 added agent_message_board_1.sqlite; legacy copies must merge too.
+    with tempfile.TemporaryDirectory(prefix="codex-switch-board-") as root_text:
+        root = Path(root_text)
+        central = root / ".codex"
+        profile = root / ".codex-work"
+        central.mkdir()
+        profile.mkdir()
+        connection = sqlite3.connect(profile / "agent_message_board_1.sqlite")
+        connection.execute("CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT NOT NULL, created_at INTEGER NOT NULL)")
+        connection.execute("INSERT INTO messages VALUES ('m1', 'hello', 1)")
+        connection.commit()
+        connection.close()
+        subprocess.run([sys.executable, str(helper), "--active-home", str(central)], check=True)
+        connection = sqlite3.connect(central / "agent_message_board_1.sqlite")
+        assert connection.execute("SELECT id, body FROM messages").fetchall() == [("m1", "hello")]
+        connection.close()
+        assert (central / ".codex-switch-legacy-state" / "work" / "sqlite" / "agent_message_board_1.sqlite").is_file()
+
     if sys.platform != "win32":
         import fcntl
         with tempfile.TemporaryDirectory(prefix="codex-switch-locked-migration-") as root_text:

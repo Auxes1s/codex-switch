@@ -201,7 +201,7 @@ sqlite_migration_needed() {
         valid_profile_name "$candidate_profile" || continue
         marker="${active_home}/.codex-switch-legacy-state/${candidate_profile}/sqlite/.merged-v1"
         [ -f "$marker" ] && continue
-        for database_name in state_5.sqlite thread_history_1.sqlite goals_1.sqlite queue_1.sqlite memories_1.sqlite logs_2.sqlite; do
+        for database_name in state_5.sqlite thread_history_1.sqlite goals_1.sqlite queue_1.sqlite memories_1.sqlite logs_2.sqlite agent_message_board_1.sqlite; do
             [ ! -f "${candidate_home}/${database_name}" ] || return 0
         done
     done

@@ -10,6 +10,17 @@ import sys
 import time
 
 
+def has_saved_credentials():
+    """True when the profile's CODEX_HOME holds a non-empty auth.json."""
+    home = os.environ.get("CODEX_HOME")
+    if not home:
+        return False
+    try:
+        return os.path.getsize(os.path.join(home, "auth.json")) > 0
+    except OSError:
+        return False
+
+
 def diagnose(codex, profile, timeout=6):
     process = subprocess.Popen(
         [codex, '-c', 'cli_auth_credentials_store="file"', 'app-server', '--stdio'],
@@ -19,6 +30,7 @@ def diagnose(codex, profile, timeout=6):
     buffers = {}
     auth_failed = False
     reason = None
+    fallback_reason = None
     code = None
 
     def send(message):
@@ -55,6 +67,12 @@ def diagnose(codex, profile, timeout=6):
                             match = re.search(r'error_code: Some\("([a-z0-9_]+)"\)', line)
                             if match:
                                 code = match[1]
+                            # Newer Codex releases log a fixed, Codex-authored
+                            # sentence instead. Accept only plain prose so no
+                            # structured payload or token can be echoed.
+                            match = re.search(r"Failed to refresh token: ([A-Z][A-Za-z ,.']{10,200})$", line.rstrip())
+                            if match and not fallback_reason:
+                                fallback_reason = match[1].strip()
                         continue
                     try:
                         response = json.loads(line)
@@ -69,6 +87,12 @@ def diagnose(codex, profile, timeout=6):
                     elif response.get("id") == 2:
                         message = response.get("error", {}).get("message", "").lower()
                         auth_failed = "401" in message and "unauthorized" in message
+                        result = response.get("result")
+                        if (not auth_failed and isinstance(result, dict) and result.get("account") is None
+                                and result.get("requiresOpenaiAuth") and has_saved_credentials()):
+                            # Codex 0.162+ reports unusable saved credentials as
+                            # a missing account rather than an RPC error.
+                            auth_failed = True
                         if not auth_failed:
                             finished = True
                             break
@@ -87,6 +111,8 @@ def diagnose(codex, profile, timeout=6):
             if reason:
                 detail = " ".join(reason.splitlines())
                 print(f"codex-switch: Codex reports: {detail}" + (f" ({code})" if code else ""), file=sys.stderr)
+            elif fallback_reason:
+                print(f"codex-switch: Codex reports: {fallback_reason}", file=sys.stderr)
             print(f"codex-switch: Sign in again: codex-switch login {profile}", file=sys.stderr)
     finally:
         selector.close()
