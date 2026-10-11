@@ -22,7 +22,7 @@ DATABASES = (
     "agent_message_board_1.sqlite",
 )
 RESERVED_PROFILES = {
-    "add", "auth", "current", "dashboard", "help", "home", "list", "login", "logout", "remove",
+    "add", "auth", "auto", "current", "dashboard", "help", "home", "list", "login", "logout", "next", "remove",
     "run", "shell-init", "status", "switch",
 }
 SKIP_TABLES = {"_sqlx_migrations", "sqlite_sequence", "backfill_state",

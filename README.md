@@ -20,7 +20,7 @@
   - [Profile Switching & Execution](#profile-switching--execution)
   - [Transparent Shell Integration](#transparent-shell-integration)
   - [Live Usage & Rate Limits Dashboard](#live-usage--rate-limits-dashboard)
-  - [Interactive Web UI / Homepage](#interactive-web-ui--homepage)
+  - [Smart Quota Rotation (next / auto)](#smart-quota-rotation-next--auto)
 - [Enterprise Safety & Domain Guards](#-enterprise-safety--domain-guards)
 - [Post-Failure Auth Diagnostics](#-post-failure-auth-diagnostics)
 - [Full Command Reference](#-full-command-reference)
@@ -39,7 +39,8 @@ When juggling multiple ChatGPT accounts (such as a personal subscription, an ent
 - 🔒 **Zero Token Copying**: Each profile owns its dedicated `CODEX_HOME` (`~/.codex-<profile>/auth.json`). Live refresh tokens are refreshed in-place and never duplicated.
 - 🔄 **Unified Sessions & History**: Session transcripts, conversation rollouts, and search indices are seamlessly shared via `~/.codex`, allowing any profile to view and resume sessions created by another.
 - 📊 **Real-Time Rate Limits Dashboard**: Inspect 5-hour and weekly window usage percentages, live reset countdowns, and available free reset credits across all accounts in a terminal view with visual progress bars.
-- 🌐 **Interactive Web UI (`--web`)**: Launch a modern, dark-mode browser dashboard with auto-refresh and one-click profile switching.
+- ⚡ **Sub-Second Quota Caching**: Caches rate limit metrics with a 60-second TTL (`~/.codex/.quota-cache.json`) for instant (<50ms) status and dashboard queries without RPC overhead. Use `--refresh` to force fresh checks.
+- ⚡ **Smart Quota Rotation (`next` / `auto`)**: Automatically switches to the profile with the highest remaining quota during coding sessions—or the shortest time until reset if all profiles are rate-limited.
 - 🤖 **Smart Profile Recommendation**: Automatically identifies which profile currently has the most available quota so you can switch before hitting rate limits.
 - 🛡️ **Enterprise Domain Guards (`--expect-domain`)**: Restricts profiles to specific email domains (e.g. `example.com`), preventing accidental logins into personal accounts on corporate profiles.
 - 🧼 **Ambient Credential Scrubbing**: Clears overriding environment variables (`OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, workload-identity variables) so launches always honor the selected profile.
@@ -256,14 +257,18 @@ codex-switch dashboard
 --------------------------------------------------------------------------------
   Quick Actions :
     Switch profile : codex-switch <profile>
-    Web dashboard  : codex-switch dashboard --web
     Live watch     : codex-switch dashboard --watch
 ================================================================================
 ```
 
 #### Dashboard Options:
 
-- **Live Watch Mode**: Auto-refreshes terminal metrics every 5 seconds:
+- **Instant Quota Caching (<50ms)**: Rate limit results are cached for 60 seconds (`~/.codex/.quota-cache.json`) to prevent repeated subprocess and network latency on consecutive queries.
+- **Force Fresh Query (`--refresh` / `--no-cache`)**:
+  ```sh
+  codex-switch dashboard --refresh
+  ```
+- **Live Watch Mode**: Auto-refreshes terminal metrics every 5 seconds (bypassing cache):
   ```sh
   codex-switch dashboard --watch
   ```
@@ -282,20 +287,23 @@ codex-switch dashboard
 
 ---
 
-### 🌐 Interactive Web UI / Homepage
+### ⚡ Smart Quota Rotation (`next` / `auto`)
 
-Launch a browser-based homepage with live auto-refresh and one-click profile switching:
+When hitting rate limits during coding or when juggling multiple accounts, rotate automatically without manually inspecting the dashboard:
 
 ```sh
-codex-switch dashboard --web
+codex-switch next
+# or
+codex-switch auto
 ```
-*(Aliases: `codex-switch dashboard -w` or `codex-switch home --web`)*
 
-- **Modern Dark UI**: Clean, responsive layout designed for high visibility.
-- **One-Click Profile Switching**: Click "Switch to work" to immediately select a profile without touching the terminal.
-- **Auto-Refresh**: Live 30-second polling keeps rate limits and reset timers current.
-- **Visual Status Badges**: Instant color-coded indicators for `READY`, `HIGH USAGE`, `RATE LIMITED`, and `SIGNED OUT`.
-- **Local & Private**: Runs on `http://127.0.0.1:8420` using Python's standard library; no external services or telemetry.
+- **Quota-Driven Switching**: Automatically switches to whichever profile currently has the highest remaining quota.
+- **Rate Limit Fallback**: If **all** profiles are rate-limited, it automatically selects whichever profile resets earliest (`resets_at`).
+- **Idempotent**: Informs you if the active profile is already the best available without performing an unnecessary switch.
+- **Scriptable**: Accepts `--json` for prompt integrations (tmux, Starship) and automated retry wrappers:
+  ```sh
+  codex-switch next --json
+  ```
 
 ---
 
@@ -351,6 +359,8 @@ If Codex exits with a failure code, `codex-switch` launches a 6-second non-block
 | :--- | :--- |
 | `codex-switch <profile>` | Selects `<profile>` as the active Codex profile. |
 | `codex-switch switch <profile>` | Explicit alias to select `<profile>`. |
+| `codex-switch next` | Automatically switches to the profile with the highest quota (or shortest reset time). |
+| `codex-switch auto` | Alias for `next`. |
 | `codex-switch run [<profile>] [--] [args...]` | Runs Codex under `<profile>` (or active profile if omitted). |
 | `codex-switch login <profile> [args...]` | Authenticates `<profile>` via browser login flow. Automatically creates profile if missing. |
 | `codex-switch auth <profile> [args...]` | Alias for `login`. |

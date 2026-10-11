@@ -203,6 +203,61 @@ printf '%s\n' "$dashboard_output" | grep -F '"profiles":' >/dev/null || fail 'da
 status_dash_output=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" "$command_path" status --json)
 printf '%s\n' "$status_dash_output" | grep -F '"profiles":' >/dev/null || fail 'status --json failed to emit JSON profiles'
 
+cache_now=$(python3 -c 'import time; print(int(time.time()))')
+cat > "$test_home/.codex/.quota-cache.json" <<EOF
+{
+  "gig": {
+    "cached_at": ${cache_now},
+    "data": {
+      "status": "ok",
+      "rate_limits": {
+        "ordinaryUsageAllowed": true,
+        "rateLimits": {
+          "primary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": $((cache_now + 3600))}
+        }
+      }
+    }
+  },
+  "work": {
+    "cached_at": ${cache_now},
+    "data": {
+      "status": "ok",
+      "rate_limits": {
+        "ordinaryUsageAllowed": true,
+        "rateLimits": {
+          "primary": {"usedPercent": 90, "windowDurationMins": 300, "resetsAt": $((cache_now + 3600))}
+        }
+      }
+    }
+  }
+}
+EOF
+
+printf '%s\n' 'work' > "$test_home/.codex/.codex-switch-active"
+next_output=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" "$command_path" next)
+printf '%s\n' "$next_output" | grep -F 'gig' >/dev/null || fail 'codex-switch next failed to select gig profile'
+assert_text_equals 'gig' "$(sed -n '1p' "$test_home/.codex/.codex-switch-active")" 'next did not update active marker'
+
+next_again=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" "$command_path" next)
+printf '%s\n' "$next_again" | grep -F "already on best profile 'gig'" >/dev/null || fail 'codex-switch next did not report already optimal'
+
+auto_json=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" "$command_path" auto --json)
+printf '%s\n' "$auto_json" | grep -F '"active_profile": "gig"' >/dev/null || fail 'codex-switch auto --json failed'
+
+printf '%s\n' 'work' > "$test_home/.codex/.codex-switch-active"
+switch_auto_out=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" "$command_path" switch auto)
+printf '%s\n' "$switch_auto_out" | grep -F 'gig' >/dev/null || fail 'codex-switch switch auto failed'
+assert_text_equals 'gig' "$(sed -n '1p' "$test_home/.codex/.codex-switch-active")" 'switch auto did not update active marker'
+
+ln -s "$test_home/.codex-gig" "$test_home/.codex-symlink"
+list_with_symlink=$(HOME="$test_home" "$command_path" list)
+if printf '%s\n' "$list_with_symlink" | grep -F 'symlink' >/dev/null; then
+    fail 'profile list included symlink'
+fi
+HOME="$test_home" "$command_path" remove symlink >/dev/null || fail 'removing symlink profile failed'
+[ ! -L "$test_home/.codex-symlink" ] || fail 'symlink was not removed'
+[ -f "$test_home/.codex-gig/auth.json" ] || fail 'removing symlink deleted target auth credentials'
+
 install_dir="${test_root}/installed/bin"
 CODEX_SWITCH_INSTALL_DIR="$install_dir" "$installer_path" >/dev/null
 assert_file_equals "$command_path" "$install_dir/codex-switch" 'installer copied different content'

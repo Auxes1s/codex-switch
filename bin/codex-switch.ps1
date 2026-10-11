@@ -8,6 +8,8 @@ function Write-Usage {
 @'
 Usage: codex-switch <profile>
        codex-switch switch <profile>
+       codex-switch next
+       codex-switch auto
        codex-switch run [<profile>] [codex arguments...]
        codex-switch add <profile>
        codex-switch login <profile> [codex login arguments...]
@@ -15,8 +17,8 @@ Usage: codex-switch <profile>
        codex-switch auth <profile> [codex login arguments...]
        codex-switch logout <profile>
        codex-switch status [<profile>]
-       codex-switch dashboard [--web] [--json] [--watch] [<profile>]
-       codex-switch home [--web] [--json] [--watch] [<profile>]
+       codex-switch dashboard [--json] [--watch] [<profile>]
+       codex-switch home [--json] [--watch] [<profile>]
        codex-switch remove <profile>
        codex-switch list
        codex-switch current
@@ -40,7 +42,7 @@ function Stop-WithError([string] $Message, [int] $ExitCode = 1) {
 
 function Test-ValidProfileName([AllowNull()][AllowEmptyString()][string] $Name) {
     if ([string]::IsNullOrEmpty($Name) -or $Name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or $Name.EndsWith('.')) { return $false }
-    return @('add','auth','current','dashboard','help','home','list','login','logout','remove','run','shell-init','status','switch') -notcontains $Name.ToLowerInvariant()
+    return @('add','auth','auto','current','dashboard','help','home','list','login','logout','next','remove','run','shell-init','status','switch') -notcontains $Name.ToLowerInvariant()
 }
 
 function Assert-ProfileName([string] $Name) {
@@ -186,6 +188,7 @@ function Get-ProfileDirectories {
     $prefix = $leaf + '-'
     if (-not [IO.Directory]::Exists($parent)) { return @() }
     return @(Get-ChildItem -LiteralPath $parent -Directory -Force | Where-Object {
+        $_.Attributes -notmatch 'ReparsePoint' -and
         $_.Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and
         (Test-ValidProfileName $_.Name.Substring($prefix.Length))
     })
@@ -479,6 +482,9 @@ try {
     }
 
     $command = $arguments[0].ToLowerInvariant()
+    if ($command -eq 'switch' -and $arguments.Count -ge 2 -and @('next','auto') -contains $arguments[1].ToLowerInvariant()) {
+        $command = 'next'
+    }
     if (@('add','logout','remove','switch') -contains $command) {
         if ($arguments.Count -ne 2) { Stop-WithError "$command requires exactly one profile" 64 }
         $profile = $arguments[1]; Assert-ProfileName $profile
@@ -487,7 +493,7 @@ try {
         $profile = $arguments[1]; Assert-ProfileName $profile
     } elseif (@('current','list','shell-init') -contains $command) {
         if ($arguments.Count -ne 1) { Stop-WithError "$command does not accept arguments" 64 }
-    } elseif (@('dashboard','home') -contains $command) {
+    } elseif (@('dashboard','home','next','auto') -contains $command) {
     } elseif ($command -eq 'status') {
         if ($arguments.Count -gt 2) { Stop-WithError 'status accepts at most one profile' 64 }
     } elseif ($command -ne 'run') {
@@ -556,6 +562,17 @@ try {
             Enable-CodexInCurrentPowerShell
             "Selected Codex profile: $profile"; break
         }
+        { $_ -in @('next','auto') } {
+            $dashboardHelper = Join-Path $PSScriptRoot 'codex-switch-dashboard.py'
+            if (-not [IO.File]::Exists($dashboardHelper)) { Stop-WithError "could not find dashboard helper: $dashboardHelper" }
+            $dashArgs = @(if ($arguments[0] -ieq 'switch') { $arguments | Select-Object -Skip 2 } else { $arguments | Select-Object -Skip 1 })
+            $py = if ($env:CODEX_SWITCH_PYTHON) { $env:CODEX_SWITCH_PYTHON } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } elseif (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { Stop-WithError 'Python 3 is required for profile auto-rotation' }
+            $codexBinary = if ($env:CODEX_SWITCH_CODEX_BIN) { $env:CODEX_SWITCH_CODEX_BIN } else { 'codex' }
+            & $py $dashboardHelper --codex-bin $codexBinary --next @dashArgs
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -eq 0) { Enable-CodexInCurrentPowerShell }
+            exit $exitCode
+        }
         { $_ -in @('dashboard','home') } {
             $dashboardHelper = Join-Path $PSScriptRoot 'codex-switch-dashboard.py'
             if (-not [IO.File]::Exists($dashboardHelper)) { Stop-WithError "could not find dashboard helper: $dashboardHelper" }
@@ -566,7 +583,7 @@ try {
             exit $LASTEXITCODE
         }
         'status' {
-            if ($arguments.Count -ge 2 -and ($arguments[1] -in @('--dashboard', '--all', '-d', '--web', '-w', '--json'))) {
+            if ($arguments.Count -ge 2 -and ($arguments[1] -in @('--dashboard', '--all', '-d', '--json'))) {
                 $dashboardHelper = Join-Path $PSScriptRoot 'codex-switch-dashboard.py'
                 if (-not [IO.File]::Exists($dashboardHelper)) { Stop-WithError "could not find dashboard helper: $dashboardHelper" }
                 $dashArgs = @($arguments | Select-Object -Skip 1)

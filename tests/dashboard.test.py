@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Exercise multi-profile rate limits dashboard, formatting, and web endpoints."""
+"""Exercise multi-profile rate limits dashboard, formatting, and quota caching."""
 
-import http.server
 import importlib.util
 import json
 import os
 from pathlib import Path
 import tempfile
-import threading
+import time
 import unittest
-import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("dashboard", ROOT / "bin" / "codex-switch-dashboard.py")
@@ -120,9 +118,89 @@ class DashboardUnitTests(unittest.TestCase):
             self.assertEqual(norm["badge_text"], "HIGH USAGE")
             self.assertEqual(norm["badge_color"], "yellow")
 
-    def test_web_server_endpoints(self):
+    def test_quota_caching_and_ttl(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Set up mock profiles in tmpdir
+            os.makedirs(os.path.join(tmpdir, ".codex"), exist_ok=True)
+            with open(os.path.join(tmpdir, ".codex", ".codex-switch-active"), "w") as f:
+                f.write("work\n")
+
+            os.makedirs(os.path.join(tmpdir, ".codex-work"), exist_ok=True)
+            with open(os.path.join(tmpdir, ".codex-work", "auth.json"), "w") as f:
+                f.write('{"auth_mode":"chatgpt"}\n')
+
+            cache_file = os.path.join(tmpdir, ".codex", ".quota-cache.json")
+            self.assertFalse(os.path.isfile(cache_file))
+
+            # Pre-seed cache to simulate fresh query
+            dashboard.save_quota_cache(cache_file, {
+                "work": {
+                    "cached_at": time.time(),
+                    "data": {
+                        "status": "ok",
+                        "email": "test@example.com",
+                        "plan_type": "plus",
+                        "rate_limits": {
+                            "ordinaryUsageAllowed": True,
+                            "rateLimits": {
+                                "primary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": time.time() + 3600},
+                            },
+                        },
+                    },
+                }
+            })
+            self.assertTrue(os.path.isfile(cache_file))
+
+            # Query should use cache without invoking nonexistent codex binary
+            data = dashboard.fetch_all_profiles_dashboard(tmpdir, "nonexistent-codex", timeout=1, cache_ttl=60)
+            work_prof = next(p for p in data["profiles"] if p["name"] == "work")
+            self.assertEqual(work_prof["email"], "test@example.com")
+            self.assertEqual(work_prof["primary"]["used_percent"], 10)
+
+            # Query with no_cache=True should bypass cache
+            data_fresh = dashboard.fetch_all_profiles_dashboard(tmpdir, "nonexistent-codex", timeout=1, no_cache=True)
+            work_fresh = next(p for p in data_fresh["profiles"] if p["name"] == "work")
+            self.assertEqual(work_fresh["readiness"], "offline")
+
+    def test_symlink_profiles_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, ".codex"), exist_ok=True)
+            with open(os.path.join(tmpdir, ".codex", ".codex-switch-active"), "w") as f:
+                f.write("work\n")
+            os.makedirs(os.path.join(tmpdir, ".codex-work"), exist_ok=True)
+            with open(os.path.join(tmpdir, ".codex-work", "auth.json"), "w") as f:
+                f.write('{"auth_mode":"chatgpt"}\n')
+            os.symlink(os.path.join(tmpdir, ".codex-work"), os.path.join(tmpdir, ".codex-alias"))
+
+            data = dashboard.fetch_all_profiles_dashboard(tmpdir, "nonexistent-codex")
+            names = [p["name"] for p in data.get("profiles", [])]
+            self.assertIn("work", names)
+            self.assertNotIn("alias", names)
+
+    def test_effective_reset_epoch(self):
+        # Primary limited only
+        p1 = {
+            "primary": {"used_percent": 100, "resets_at": 1000},
+            "secondary": {"used_percent": 20, "resets_at": 5000},
+        }
+        self.assertEqual(dashboard.get_effective_reset_epoch(p1), 1000)
+
+        # Secondary limited only
+        p2 = {
+            "primary": {"used_percent": 50, "resets_at": 1000},
+            "secondary": {"used_percent": 100, "resets_at": 5000},
+        }
+        self.assertEqual(dashboard.get_effective_reset_epoch(p2), 5000)
+
+        # Both limited
+        p3 = {
+            "primary": {"used_percent": 100, "resets_at": 1000},
+            "secondary": {"used_percent": 100, "resets_at": 5000},
+        }
+        self.assertEqual(dashboard.get_effective_reset_epoch(p3), 5000)
+
+    def test_recommendation_when_all_rate_limited(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as tmpdir:
             os.makedirs(os.path.join(tmpdir, ".codex"), exist_ok=True)
             with open(os.path.join(tmpdir, ".codex", ".codex-switch-active"), "w") as f:
                 f.write("work\n")
@@ -135,53 +213,169 @@ class DashboardUnitTests(unittest.TestCase):
             with open(os.path.join(tmpdir, ".codex-personal", "auth.json"), "w") as f:
                 f.write('{"auth_mode":"chatgpt"}\n')
 
-            # Start temporary server on ephemeral port
-            dashboard.DashboardHandler.home_dir = tmpdir
-            dashboard.DashboardHandler.codex_bin = "nonexistent-codex"
+            cache_file = os.path.join(tmpdir, ".codex", ".quota-cache.json")
+            dashboard.save_quota_cache(cache_file, {
+                "work": {
+                    "cached_at": now,
+                    "data": {
+                        "status": "ok",
+                        "rate_limits": {
+                            "ordinaryUsageAllowed": False,
+                            "rateLimits": {
+                                "primary": {"usedPercent": 100, "windowDurationMins": 300, "resetsAt": now + 3600},
+                            },
+                        },
+                    },
+                },
+                "personal": {
+                    "cached_at": now,
+                    "data": {
+                        "status": "ok",
+                        "rate_limits": {
+                            "ordinaryUsageAllowed": False,
+                            "rateLimits": {
+                                "primary": {"usedPercent": 100, "windowDurationMins": 300, "resetsAt": now + 600},
+                            },
+                        },
+                    },
+                },
+            })
 
-            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), dashboard.DashboardHandler)
-            port = server.server_address[1]
-            t = threading.Thread(target=server.serve_forever, daemon=True)
-            t.start()
+            data = dashboard.fetch_all_profiles_dashboard(tmpdir, "nonexistent-codex", timeout=1)
+            summ = data["summary"]
+            self.assertEqual(summ["recommended"], "personal")
+            self.assertEqual(summ["recommended_reason"], "reset_time")
+            self.assertTrue("in 10m" in summ["recommended_detail"] or "in 9m" in summ["recommended_detail"])
 
-            try:
-                base_url = f"http://127.0.0.1:{port}"
-                # Test GET /
-                with urllib.request.urlopen(f"{base_url}/", timeout=3) as resp:
-                    self.assertEqual(resp.status, 200)
-                    html = resp.read().decode("utf-8")
-                    self.assertIn("codex-switch", html)
-                    self.assertIn("Profile Dashboard", html)
+    def test_switch_profile_action(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, ".codex"), exist_ok=True)
+            active_file = os.path.join(tmpdir, ".codex", ".codex-switch-active")
+            with open(active_file, "w") as f:
+                f.write("work\n")
 
-                # Test GET /api/status
-                with urllib.request.urlopen(f"{base_url}/api/status", timeout=3) as resp:
-                    self.assertEqual(resp.status, 200)
-                    data = json.loads(resp.read().decode("utf-8"))
-                    self.assertEqual(data.get("active_profile"), "work")
-                    names = [p["name"] for p in data.get("profiles", [])]
-                    self.assertIn("work", names)
-                    self.assertIn("personal", names)
+            os.makedirs(os.path.join(tmpdir, ".codex-personal"), exist_ok=True)
+            with open(os.path.join(tmpdir, ".codex-personal", "auth.json"), "w") as f:
+                f.write('{"auth_mode":"chatgpt"}\n')
 
-                # Test POST /api/switch
-                switch_payload = json.dumps({"profile": "personal"}).encode("utf-8")
-                req = urllib.request.Request(
-                    f"{base_url}/api/switch",
-                    data=switch_payload,
-                    headers={"Content-Type": "application/json"},
-                )
-                with urllib.request.urlopen(req, timeout=3) as resp:
-                    self.assertEqual(resp.status, 200)
-                    switch_res = json.loads(resp.read().decode("utf-8"))
-                    self.assertTrue(switch_res.get("success"))
-                    self.assertEqual(switch_res.get("active"), "personal")
+            ok, err = dashboard.switch_profile_action("personal", tmpdir, "nonexistent-codex")
+            self.assertTrue(ok)
+            self.assertIsNone(err)
 
-                # Verify marker changed on disk
-                with open(os.path.join(tmpdir, ".codex", ".codex-switch-active")) as f:
-                    self.assertEqual(f.read().strip(), "personal")
+            with open(active_file, "r") as f:
+                self.assertEqual(f.read().strip(), "personal")
 
-            finally:
-                server.shutdown()
-                server.server_close()
+            ok, err = dashboard.switch_profile_action("ghost", tmpdir, "nonexistent-codex")
+            self.assertFalse(ok)
+            self.assertIn("profile directory does not exist", err)
+
+    def test_auto_rotate_handler(self):
+        import io
+        from contextlib import redirect_stdout
+
+        now = time.time()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, ".codex"), exist_ok=True)
+            active_file = os.path.join(tmpdir, ".codex", ".codex-switch-active")
+            with open(active_file, "w") as f:
+                f.write("work\n")
+
+            os.makedirs(os.path.join(tmpdir, ".codex-work"), exist_ok=True)
+            with open(os.path.join(tmpdir, ".codex-work", "auth.json"), "w") as f:
+                f.write('{"auth_mode":"chatgpt"}\n')
+
+            os.makedirs(os.path.join(tmpdir, ".codex-personal"), exist_ok=True)
+            with open(os.path.join(tmpdir, ".codex-personal", "auth.json"), "w") as f:
+                f.write('{"auth_mode":"chatgpt"}\n')
+
+            cache_file = os.path.join(tmpdir, ".codex", ".quota-cache.json")
+            dashboard.save_quota_cache(cache_file, {
+                "work": {
+                    "cached_at": now,
+                    "data": {
+                        "status": "ok",
+                        "rate_limits": {
+                            "ordinaryUsageAllowed": True,
+                            "rateLimits": {
+                                "primary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": now + 3600},
+                            },
+                        },
+                    },
+                },
+                "personal": {
+                    "cached_at": now,
+                    "data": {
+                        "status": "ok",
+                        "rate_limits": {
+                            "ordinaryUsageAllowed": True,
+                            "rateLimits": {
+                                "primary": {"usedPercent": 80, "windowDurationMins": 300, "resetsAt": now + 3600},
+                            },
+                        },
+                    },
+                },
+            })
+
+            data = dashboard.fetch_all_profiles_dashboard(tmpdir, "nonexistent-codex", timeout=1)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    dashboard.handle_auto_rotate(data, tmpdir, "nonexistent-codex", as_json=False)
+                self.assertEqual(cm.exception.code, 0)
+            self.assertIn("already on best profile 'work'", buf.getvalue())
+
+            with open(active_file, "w") as f:
+                f.write("personal\n")
+            data["active_profile"] = "personal"
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    dashboard.handle_auto_rotate(data, tmpdir, "nonexistent-codex", as_json=False)
+                self.assertEqual(cm.exception.code, 0)
+            self.assertIn("Switched to Codex profile: work", buf.getvalue())
+            with open(active_file, "r") as f:
+                self.assertEqual(f.read().strip(), "work")
+
+            with open(active_file, "w") as f:
+                f.write("personal\n")
+            data["active_profile"] = "personal"
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    dashboard.handle_auto_rotate(data, tmpdir, "nonexistent-codex", as_json=True)
+                self.assertEqual(cm.exception.code, 0)
+            res = json.loads(buf.getvalue())
+            self.assertTrue(res["success"])
+            self.assertTrue(res["switched"])
+            self.assertEqual(res["active_profile"], "work")
+            self.assertEqual(res["reason"], "quota")
+
+    def test_recommendation_tie_breaks_favor_active_profile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, ".codex"), exist_ok=True)
+            active_file = os.path.join(tmpdir, ".codex", ".codex-switch-active")
+            with open(active_file, "w") as f:
+                f.write("personal\n")
+
+            for pname in ("gig", "personal", "work"):
+                pdir = os.path.join(tmpdir, f".codex-{pname}")
+                os.makedirs(pdir, exist_ok=True)
+                with open(os.path.join(pdir, "auth.json"), "w") as f:
+                    f.write('{"auth_mode":"chatgpt"}\n')
+
+            now = time.time()
+            cache_file = os.path.join(tmpdir, ".codex", ".quota-cache.json")
+            dashboard.save_quota_cache(cache_file, {
+                pname: {
+                    "cached_at": now,
+                    "data": {"status": "ok", "error": "workspace routing discovery timed out"},
+                }
+                for pname in ("gig", "personal", "work")
+            })
+
+            data = dashboard.fetch_all_profiles_dashboard(tmpdir, "nonexistent-codex", timeout=1)
+            self.assertEqual(data["summary"]["recommended"], "personal")
 
 
 if __name__ == "__main__":

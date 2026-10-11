@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
-"""Interactive dashboard, rate limits breakdown, and web homepage for codex-switch."""
+"""Interactive dashboard, rate limits breakdown, and auth diagnostics for codex-switch."""
 
 import argparse
 import base64
 import concurrent.futures
 from datetime import datetime
 import glob
-import http.server
 import json
 import os
 import re
+import selectors
 import subprocess
 import sys
 import time
-import urllib.parse
-import webbrowser
 
 RESERVED_COMMANDS = {
-    "add", "auth", "current", "dashboard", "help", "home",
-    "list", "login", "logout", "remove", "run", "shell-init",
+    "add", "auth", "auto", "current", "dashboard", "help", "home",
+    "list", "login", "logout", "next", "remove", "run", "shell-init",
     "status", "switch",
 }
 
@@ -255,14 +253,6 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
 
 def normalize_profile_data(profile_name, raw_data, active_profile, home_dir, now_epoch):
     profile_home = os.path.join(home_dir, f".codex-{profile_name}")
-    is_link = os.path.islink(profile_home)
-    link_target = os.readlink(profile_home) if is_link else None
-    alias_of = None
-    if link_target:
-        m = re.search(r"\.codex-([A-Za-z0-9._-]+)", link_target)
-        if m:
-            alias_of = m.group(1)
-
     is_active = (profile_name == active_profile)
     status_raw = raw_data.get("status", "unknown")
     email = raw_data.get("email") or "Unknown Account"
@@ -346,8 +336,6 @@ def normalize_profile_data(profile_name, raw_data, active_profile, home_dir, now
     return {
         "name": profile_name,
         "is_active": is_active,
-        "is_alias": is_link,
-        "alias_of": alias_of,
         "path": profile_home,
         "readiness": readiness,
         "badge_text": badge_text,
@@ -362,30 +350,112 @@ def normalize_profile_data(profile_name, raw_data, active_profile, home_dir, now
     }
 
 
-def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7):
+def load_quota_cache(cache_path):
+    if not os.path.isfile(cache_path):
+        return {}
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data.get("profiles", {})
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_quota_cache(cache_path, profiles_cache):
+    try:
+        parent = os.path.dirname(cache_path)
+        os.makedirs(parent, exist_ok=True)
+        tmp_path = cache_path + f".tmp.{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": 1,
+                "timestamp": time.time(),
+                "profiles": profiles_cache,
+            }, f, indent=2)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, cache_path)
+    except OSError:
+        pass
+
+
+def get_effective_reset_epoch(profile_dict):
+    pri = profile_dict.get("primary")
+    sec = profile_dict.get("secondary")
+    pri_resets = pri.get("resets_at") if pri else None
+    sec_resets = sec.get("resets_at") if sec else None
+
+    pri_exhausted = pri and (pri.get("used_percent") is not None and pri.get("used_percent") >= 100)
+    sec_exhausted = sec and (sec.get("used_percent") is not None and sec.get("used_percent") >= 100)
+
+    if pri_exhausted and sec_exhausted:
+        if pri_resets is not None and sec_resets is not None:
+            return max(pri_resets, sec_resets)
+        return pri_resets if pri_resets is not None else (sec_resets if sec_resets is not None else float("inf"))
+    elif sec_exhausted:
+        return sec_resets if sec_resets is not None else float("inf")
+    elif pri_exhausted:
+        return pri_resets if pri_resets is not None else float("inf")
+    else:
+        epochs = [t for t in (pri_resets, sec_resets) if t is not None]
+        return min(epochs) if epochs else float("inf")
+
+
+def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7, no_cache=False, cache_ttl=60):
     now_epoch = time.time()
     active_profile = get_active_profile(home_dir)
+    cache_path = os.path.join(home_dir, ".codex", ".quota-cache.json")
+    cached_profiles = {} if no_cache else load_quota_cache(cache_path)
+
     profile_dirs = glob.glob(os.path.join(home_dir, ".codex-*"))
     profile_names = []
     for pdir in sorted(profile_dirs):
-        if not os.path.isdir(pdir):
+        if not os.path.isdir(pdir) or os.path.islink(pdir):
             continue
         pname = os.path.basename(pdir).replace(".codex-", "")
         if valid_profile_name(pname):
             profile_names.append(pname)
 
     results_raw = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(profile_names)))) as executor:
-        future_to_prof = {
-            executor.submit(query_codex_profile, pname, home_dir, codex_bin, timeout): pname
-            for pname in profile_names
-        }
-        for future in concurrent.futures.as_completed(future_to_prof):
-            pname = future_to_prof[future]
-            try:
-                results_raw[pname] = future.result()
-            except Exception as e:
-                results_raw[pname] = {"status": "error", "error": str(e)}
+    needed = []
+    for pname in profile_names:
+        entry = cached_profiles.get(pname)
+        if (
+            not no_cache
+            and entry
+            and isinstance(entry, dict)
+            and "cached_at" in entry
+            and (now_epoch - entry["cached_at"]) < cache_ttl
+            and "data" in entry
+        ):
+            results_raw[pname] = entry["data"]
+        else:
+            needed.append(pname)
+
+    if needed:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(needed)))) as executor:
+            future_to_prof = {
+                executor.submit(query_codex_profile, pname, home_dir, codex_bin, timeout): pname
+                for pname in needed
+            }
+            for future in concurrent.futures.as_completed(future_to_prof):
+                pname = future_to_prof[future]
+                try:
+                    res = future.result()
+                    results_raw[pname] = res
+                    cached_profiles[pname] = {
+                        "cached_at": now_epoch,
+                        "data": res,
+                    }
+                except Exception as e:
+                    results_raw[pname] = {"status": "error", "error": str(e)}
+
+        clean_cache = {k: v for k, v in cached_profiles.items() if k in profile_names}
+        save_quota_cache(cache_path, clean_cache)
 
     profiles_data = []
     for pname in profile_names:
@@ -396,20 +466,57 @@ def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7):
     high_count = sum(1 for p in profiles_data if p["readiness"] == "high_usage")
     limited_count = sum(1 for p in profiles_data if p["readiness"] == "rate_limited")
     signed_out_count = sum(1 for p in profiles_data if p["readiness"] == "signed_out")
-
-    # Determine recommended profile (highest remaining quota)
+    # Determine recommended profile
     candidates = [
         p for p in profiles_data
-        if p["readiness"] in ("ready", "high_usage") and not p["is_alias"]
+        if p["readiness"] in ("ready", "high_usage")
     ]
-    candidates.sort(
-        key=lambda x: (
-            0 if x["primary"] is not None else 1,
-            -(x["primary"]["remaining_percent"]) if x["primary"] else 0,
-            -(x["secondary"]["remaining_percent"]) if x["secondary"] else 0,
+    best_profile = None
+    best_reason = None
+    best_detail = None
+
+    if candidates:
+        candidates.sort(
+            key=lambda x: (
+                0 if x["primary"] is not None else 1,
+                -(x["primary"]["remaining_percent"]) if x["primary"] else 0,
+                -(x["secondary"]["remaining_percent"]) if x["secondary"] else 0,
+                0 if x["is_active"] else 1,
+            )
         )
-    )
-    best_profile = candidates[0]["name"] if candidates else None
+        best = candidates[0]
+        best_profile = best["name"]
+        best_reason = "quota"
+        pri = best.get("primary")
+        sec = best.get("secondary")
+        if pri and pri.get("remaining_percent") is not None:
+            best_detail = f"{pri['remaining_percent']}% quota left"
+        elif sec and sec.get("remaining_percent") is not None:
+            best_detail = f"{sec['remaining_percent']}% quota left"
+        else:
+            best_detail = "quota available"
+    else:
+        # Fallback when all accounts are rate-limited: shortest time until reset
+        limited_candidates = [
+            p for p in profiles_data
+            if p["readiness"] == "rate_limited"
+        ]
+        if limited_candidates:
+            limited_candidates.sort(
+                key=lambda x: (
+                    get_effective_reset_epoch(x),
+                    0 if x["is_active"] else 1,
+                )
+            )
+            best = limited_candidates[0]
+            eff_epoch = get_effective_reset_epoch(best)
+            if eff_epoch != float("inf"):
+                best_profile = best["name"]
+                best_reason = "reset_time"
+                countdown = format_countdown(eff_epoch, now_epoch)
+                reset_time = format_reset_time(eff_epoch, now_epoch)
+                time_str = f" at {reset_time}" if reset_time else ""
+                best_detail = f"resets {countdown}{time_str}"
 
     return {
         "timestamp": now_epoch,
@@ -421,6 +528,8 @@ def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7):
             "rate_limited": limited_count,
             "signed_out": signed_out_count,
             "recommended": best_profile,
+            "recommended_reason": best_reason,
+            "recommended_detail": best_detail,
         },
         "profiles": profiles_data,
     }
@@ -467,7 +576,21 @@ def render_terminal(data, use_color=True, focus_profile=None):
         f"{c_dim}{summ.get('signed_out', 0)} signed out{c_reset}"
     )
     if summ.get("recommended"):
-        lines.append(f"  {c_bold}Recommended    :{c_reset} Switch to {c_green}{c_bold}{summ.get('recommended')}{c_reset} (highest remaining quota)")
+        rec = summ.get("recommended")
+        if rec == active:
+            if summ.get("recommended_reason") == "reset_time":
+                detail = summ.get("recommended_detail", "resets earliest")
+                lines.append(f"  {c_bold}Recommended    :{c_reset} Active profile {c_green}{c_bold}{rec}{c_reset} resets earliest ({detail})")
+            else:
+                detail = summ.get("recommended_detail", "optimal")
+                lines.append(f"  {c_bold}Recommended    :{c_reset} Active profile {c_green}{c_bold}{rec}{c_reset} is optimal ({detail})")
+        else:
+            if summ.get("recommended_reason") == "reset_time":
+                detail = summ.get("recommended_detail", "resets soonest")
+                lines.append(f"  {c_bold}Recommended    :{c_reset} Switch to {c_yellow}{c_bold}{rec}{c_reset} (all limited; {detail})")
+            else:
+                detail = summ.get("recommended_detail", "highest remaining quota")
+                lines.append(f"  {c_bold}Recommended    :{c_reset} Switch to {c_green}{c_bold}{rec}{c_reset} ({detail})")
     lines.append(f"{c_dim}--------------------------------------------------------------------------------{c_reset}")
 
     profiles = data.get("profiles", [])
@@ -481,12 +604,11 @@ def render_terminal(data, use_color=True, focus_profile=None):
             is_act = p["is_active"]
             act_icon = f"{c_green}●{c_reset}" if is_act else f"{c_dim}○{c_reset}"
             act_badge = f" {c_green}{c_bold}(ACTIVE){c_reset}" if is_act else ""
-            alias_note = f" {c_dim}(alias of {p['alias_of']}){c_reset}" if p.get("is_alias") and p.get("alias_of") else ""
 
             b_color = c_green if p["badge_color"] == "green" else c_yellow if p["badge_color"] == "yellow" else c_red if p["badge_color"] == "red" else c_dim
             badge = f"[{b_color}{c_bold}{p['badge_text']}{c_reset}]"
 
-            p_title = f"{act_icon} {c_bold}{p['name']}{c_reset}{act_badge}{alias_note}"
+            p_title = f"{act_icon} {c_bold}{p['name']}{c_reset}{act_badge}"
             lines.append(f"\n{p_title}  {badge}")
             lines.append(f"  Account     : {p['email']} {c_dim}({p['plan_label']}){c_reset}")
 
@@ -509,448 +631,145 @@ def render_terminal(data, use_color=True, focus_profile=None):
 
     lines.append(f"\n{c_dim}--------------------------------------------------------------------------------{c_reset}")
     lines.append(f"  {c_bold}Quick Actions :{c_reset}")
+    lines.append(f"    Auto-rotate    : {c_cyan}codex-switch next{c_reset}")
     lines.append(f"    Switch profile : {c_cyan}codex-switch <profile>{c_reset}")
-    lines.append(f"    Web dashboard  : {c_cyan}codex-switch dashboard --web{c_reset}")
     lines.append(f"    Live watch     : {c_cyan}codex-switch dashboard --watch{c_reset}")
     lines.append(f"{c_bold}{c_cyan}================================================================================{c_reset}\n")
 
     return "\n".join(lines)
 
 
-# Web UI Single Page Template
-HTML_PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>codex-switch Dashboard</title>
-  <style>
-    :root {
-      --bg: #090b10;
-      --surface: #12151e;
-      --surface-hover: #171b26;
-      --border: #232838;
-      --border-focus: #3b82f6;
-      --text: #f3f4f6;
-      --text-muted: #9ca3af;
-      --green: #10b981;
-      --green-bg: rgba(16, 185, 129, 0.12);
-      --yellow: #f59e0b;
-      --yellow-bg: rgba(245, 158, 11, 0.12);
-      --red: #ef4444;
-      --red-bg: rgba(239, 68, 68, 0.12);
-      --blue: #3b82f6;
-      --blue-bg: rgba(59, 130, 246, 0.12);
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background-color: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      padding: 24px;
-      line-height: 1.5;
-    }
-    .container { max-width: 1100px; margin: 0 auto; }
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding-bottom: 24px;
-      border-bottom: 1px solid var(--border);
-      margin-bottom: 24px;
-      flex-wrap: wrap;
-      gap: 16px;
-    }
-    .brand { display: flex; align-items: center; gap: 12px; }
-    .brand h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
-    .brand .badge {
-      background: var(--blue-bg);
-      color: var(--blue);
-      border: 1px solid rgba(59, 130, 246, 0.3);
-      padding: 3px 8px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 600;
-    }
-    .header-actions { display: flex; align-items: center; gap: 12px; }
-    button {
-      background: var(--surface);
-      color: var(--text);
-      border: 1px solid var(--border);
-      padding: 8px 16px;
-      border-radius: 8px;
-      font-size: 13px;
-      font-weight: 600;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      transition: all 0.15s ease;
-    }
-    button:hover { background: var(--surface-hover); border-color: #3b4256; }
-    button.primary { background: #2563eb; border-color: #3b82f6; }
-    button.primary:hover { background: #1d4ed8; }
-    button.switch-btn { width: 100%; justify-content: center; margin-top: 12px; }
-    .refresh-spinner { display: inline-block; transition: transform 0.6s ease; }
-    .refreshing .refresh-spinner { transform: rotate(360deg); }
+def has_saved_credentials():
+    """True when the profile's CODEX_HOME holds a non-empty auth.json."""
+    home = os.environ.get("CODEX_HOME")
+    if not home:
+        return False
+    try:
+        return os.path.getsize(os.path.join(home, "auth.json")) > 0
+    except OSError:
+        return False
 
-    .summary-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 16px;
-      margin-bottom: 28px;
-    }
-    .summary-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      padding: 16px 20px;
-      border-radius: 12px;
-    }
-    .summary-card .label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
-    .summary-card .val { font-size: 24px; font-weight: 700; margin-top: 4px; display: flex; align-items: center; gap: 8px; }
 
-    .profiles-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-      gap: 20px;
-    }
-    .profile-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 20px;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      position: relative;
-      transition: border-color 0.15s ease, transform 0.15s ease;
-    }
-    .profile-card:hover { border-color: #3b4256; transform: translateY(-2px); }
-    .profile-card.active { border-color: var(--green); box-shadow: 0 0 0 1px var(--green); }
-    .card-top { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
-    .prof-name { font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
-    .active-pill {
-      background: var(--green);
-      color: #000;
-      font-size: 10px;
-      font-weight: 800;
-      padding: 2px 6px;
-      border-radius: 4px;
-      letter-spacing: 0.5px;
-    }
-    .status-badge {
-      font-size: 11px;
-      font-weight: 700;
-      padding: 3px 8px;
-      border-radius: 6px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    .status-badge.green { background: var(--green-bg); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
-    .status-badge.yellow { background: var(--yellow-bg); color: var(--yellow); border: 1px solid rgba(245, 158, 11, 0.3); }
-    .status-badge.red { background: var(--red-bg); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.3); }
-    .status-badge.gray { background: rgba(156, 163, 175, 0.12); color: var(--text-muted); border: 1px solid rgba(156, 163, 175, 0.2); }
+def diagnose(codex, profile, timeout=6):
+    process = subprocess.Popen(
+        [codex, "-c", 'cli_auth_credentials_store="file"', "app-server", "--stdio"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    selector = selectors.DefaultSelector()
+    buffers = {}
+    auth_failed = False
+    reason = None
+    fallback_reason = None
+    code = None
 
-    .account-meta { font-size: 13px; color: var(--text-muted); margin-bottom: 16px; word-break: break-all; }
-    .plan-chip {
-      background: rgba(255, 255, 255, 0.08);
-      color: var(--text);
-      padding: 2px 6px;
-      border-radius: 4px;
-      font-size: 11px;
-      font-weight: 600;
-      margin-left: 6px;
-    }
+    def send(message):
+        process.stdin.write((json.dumps(message) + "\n").encode())
+        process.stdin.flush()
 
-    .limit-block { margin-top: 14px; }
-    .limit-header { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 6px; }
-    .limit-header .name { font-weight: 600; color: var(--text); }
-    .limit-header .reset { color: var(--text-muted); }
-    .progress-bar-bg {
-      background: #1e2230;
-      height: 8px;
-      border-radius: 999px;
-      overflow: hidden;
-      margin-bottom: 4px;
-    }
-    .progress-bar-fill { height: 100%; border-radius: 999px; transition: width 0.3s ease; }
-    .progress-bar-fill.green { background: linear-gradient(90deg, #10b981, #059669); }
-    .progress-bar-fill.yellow { background: linear-gradient(90deg, #f59e0b, #d97706); }
-    .progress-bar-fill.red { background: linear-gradient(90deg, #ef4444, #dc2626); }
-    .limit-sub { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); }
+    try:
+        for stream in (process.stdout, process.stderr):
+            selector.register(stream, selectors.EVENT_READ)
+            buffers[stream] = b""
+        send({"id": 1, "method": "initialize", "params": {
+            "clientInfo": {"name": "codex-switch-diagnostic", "version": "1"},
+        }})
+        deadline = time.monotonic() + timeout
+        finished = False
+        while selector.get_map() and not finished and time.monotonic() < deadline:
+            for key, _ in selector.select(max(0, deadline - time.monotonic())):
+                stream = key.fileobj
+                data = os.read(stream.fileno(), 65536)
+                if not data:
+                    selector.unregister(stream)
+                    continue
+                buffers[stream] += data
+                while b"\n" in buffers[stream]:
+                    line, buffers[stream] = buffers[stream].split(b"\n", 1)
+                    line = line.decode(errors="replace")
+                    if stream is process.stderr:
+                        if "Failed to refresh token" in line:
+                            match = re.search(r'error_message: Some\("((?:\\.|[^"\\])*)"\)', line)
+                            if match:
+                                reason = json.loads('"' + match[1] + '"')
+                            match = re.search(r'error_code: Some\("([a-z0-9_]+)"\)', line)
+                            if match:
+                                code = match[1]
+                            match = re.search(r"Failed to refresh token: ([A-Za-z ,.']{10,200})$", line.rstrip())
+                            if match and not fallback_reason:
+                                fallback_reason = match[1].strip()
+                        continue
+                    try:
+                        response = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if response.get("id") == 1:
+                        if "error" in response:
+                            finished = True
+                            break
+                        send({"method": "initialized"})
+                        send({"id": 2, "method": "account/read", "params": {"refreshToken": False}})
+                    elif response.get("id") == 2:
+                        message = response.get("error", {}).get("message", "").lower()
+                        auth_failed = "401" in message and "unauthorized" in message
+                        result = response.get("result")
+                        if (not auth_failed and isinstance(result, dict) and result.get("account") is None
+                                and result.get("requiresOpenaiAuth") and has_saved_credentials()):
+                            auth_failed = True
+                        if not auth_failed:
+                            finished = True
+                            break
+                        send({"id": 3, "method": "account/read", "params": {"refreshToken": True}})
+                    elif response.get("id") == 3:
+                        result = response.get("result", {})
+                        if result.get("account"):
+                            auth_failed = False
+                        finished = True
+        if auth_failed:
+            print(f"codex-switch: Codex authentication failed for profile '{profile}'.", file=sys.stderr)
+            if reason:
+                detail = " ".join(reason.splitlines())
+                print(f"codex-switch: Codex reports: {detail}" + (f" ({code})" if code else ""), file=sys.stderr)
+            elif fallback_reason:
+                print(f"codex-switch: Codex reports: {fallback_reason}", file=sys.stderr)
+            print(f"codex-switch: Sign in again: codex-switch login {profile}", file=sys.stderr)
+    finally:
+        selector.close()
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
 
-    .credits-banner {
-      background: var(--yellow-bg);
-      border: 1px solid rgba(245, 158, 11, 0.3);
-      color: #fbbf24;
-      padding: 8px 12px;
-      border-radius: 8px;
-      font-size: 12px;
-      font-weight: 600;
-      margin-top: 14px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
 
-    .toast {
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      background: #1e2230;
-      color: var(--text);
-      border: 1px solid var(--border);
-      padding: 12px 20px;
-      border-radius: 10px;
-      font-size: 14px;
-      font-weight: 600;
-      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-      display: none;
-      z-index: 100;
-    }
-    .toast.show { display: block; animation: slideUp 0.2s ease; }
-    @keyframes slideUp { from { transform: translateY(10px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
-
-    .footer {
-      margin-top: 40px;
-      padding-top: 20px;
-      border-top: 1px solid var(--border);
-      text-align: center;
-      font-size: 13px;
-      color: var(--text-muted);
-    }
-    .cli-chip {
-      background: #171b26;
-      border: 1px solid var(--border);
-      padding: 4px 10px;
-      border-radius: 6px;
-      font-family: monospace;
-      font-size: 12px;
-      color: #93c5fd;
-      cursor: pointer;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <div class="brand">
-        <h1>⚡ codex-switch</h1>
-        <span class="badge">Profile Dashboard</span>
-      </div>
-      <div class="header-actions">
-        <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-muted); cursor: pointer;">
-          <input type="checkbox" id="autoRefresh" checked> Auto-refresh (30s)
-        </label>
-        <button id="refreshBtn" onclick="loadDashboard()">
-          <span class="refresh-spinner">↻</span> Refresh
-        </button>
-      </div>
-    </header>
-
-    <div class="summary-grid" id="summaryGrid">
-      <div class="summary-card">
-        <div class="label">Active Profile</div>
-        <div class="val" id="activeProfileVal">-</div>
-      </div>
-      <div class="summary-card">
-        <div class="label">Ready for Use</div>
-        <div class="val" style="color: var(--green);" id="readyProfilesVal">-</div>
-      </div>
-      <div class="summary-card">
-        <div class="label">Recommended Next</div>
-        <div class="val" style="color: var(--blue);" id="recommendedVal">-</div>
-      </div>
-      <div class="summary-card">
-        <div class="label">Total Profiles</div>
-        <div class="val" id="totalProfilesVal">-</div>
-      </div>
-    </div>
-
-    <div class="profiles-grid" id="profilesGrid">
-      <div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted);">
-        Loading profiles and rate limits...
-      </div>
-    </div>
-
-    <div class="footer">
-      Run in terminal: <span class="cli-chip" onclick="copyText('codex-switch dashboard')">codex-switch dashboard</span>
-      &nbsp;•&nbsp; Switch: <span class="cli-chip" onclick="copyText('codex-switch <profile>')">codex-switch &lt;profile&gt;</span>
-    </div>
-  </div>
-
-  <div class="toast" id="toast">Profile switched!</div>
-
-  <script>
-    let timer = null;
-
-    function showToast(msg) {
-      const t = document.getElementById('toast');
-      t.innerText = msg;
-      t.classList.add('show');
-      setTimeout(() => t.classList.remove('show'), 3000);
-    }
-
-    function copyText(txt) {
-      navigator.clipboard.writeText(txt);
-      showToast('Copied: ' + txt);
-    }
-
-    async function switchProfile(name) {
-      try {
-        const res = await fetch('/api/switch', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ profile: name })
-        });
-        const data = await res.json();
-        if (data.success) {
-          showToast('Switched active profile to "' + name + '"');
-          loadDashboard();
-        } else {
-          alert('Failed to switch: ' + (data.error || 'Unknown error'));
-        }
-      } catch (err) {
-        alert('Network error switching profile: ' + err);
-      }
-    }
-
-    async function loadDashboard() {
-      const btn = document.getElementById('refreshBtn');
-      btn.classList.add('refreshing');
-      try {
-        const res = await fetch('/api/status');
-        const data = await res.json();
-        renderDashboard(data);
-      } catch (err) {
-        console.error('Failed to load status:', err);
-      } finally {
-        setTimeout(() => btn.classList.remove('refreshing'), 600);
-      }
-    }
-
-    function renderDashboard(data) {
-      const summ = data.summary || {};
-      document.getElementById('activeProfileVal').innerText = data.active_profile || 'None';
-      document.getElementById('readyProfilesVal').innerText = `${summ.ready || 0} / ${summ.total || 0}`;
-      document.getElementById('recommendedVal').innerText = summ.recommended || 'None';
-      document.getElementById('totalProfilesVal').innerText = summ.total || 0;
-
-      const grid = document.getElementById('profilesGrid');
-      grid.innerHTML = '';
-
-      (data.profiles || []).forEach(p => {
-        const card = document.createElement('div');
-        card.className = 'profile-card' + (p.is_active ? ' active' : '');
-
-        let primaryHtml = '';
-        if (p.primary) {
-          const left = p.primary.remaining_percent;
-          const used = p.primary.used_percent;
-          const fillClass = left >= 30 ? 'green' : (left >= 10 ? 'yellow' : 'red');
-          primaryHtml = `
-            <div class="limit-block">
-              <div class="limit-header">
-                <span class="name">${p.primary.name}</span>
-                <span class="reset">Resets ${p.primary.resets_in}</span>
-              </div>
-              <div class="progress-bar-bg">
-                <div class="progress-bar-fill ${fillClass}" style="width: ${Math.min(100, left)}%;"></div>
-              </div>
-              <div class="limit-sub">
-                <span style="font-weight: 600; color: var(--text);">${left}% left</span>
-                <span>(${used}% used)</span>
-              </div>
-            </div>
-          `;
-        }
-
-        let secondaryHtml = '';
-        if (p.secondary) {
-          const left = p.secondary.remaining_percent;
-          const used = p.secondary.used_percent;
-          const fillClass = left >= 30 ? 'green' : (left >= 10 ? 'yellow' : 'red');
-          secondaryHtml = `
-            <div class="limit-block">
-              <div class="limit-header">
-                <span class="name">${p.secondary.name}</span>
-                <span class="reset">Resets ${p.secondary.resets_in}</span>
-              </div>
-              <div class="progress-bar-bg">
-                <div class="progress-bar-fill ${fillClass}" style="width: ${Math.min(100, left)}%;"></div>
-              </div>
-              <div class="limit-sub">
-                <span style="font-weight: 600; color: var(--text);">${left}% left</span>
-                <span>(${used}% used)</span>
-              </div>
-            </div>
-          `;
-        }
-
-        let creditsHtml = '';
-        if (p.reset_credits > 0) {
-          creditsHtml = `<div class="credits-banner">✨ ${p.reset_credits} Rate Limit Reset(s) Available</div>`;
-        }
-
-        let actionBtn = '';
-        if (p.is_active) {
-          actionBtn = `<button disabled style="opacity: 0.7; cursor: default; width: 100%; justify-content: center; margin-top: 14px;">✓ Currently Active</button>`;
-        } else if (p.readiness === 'signed_out') {
-          actionBtn = `<button onclick="copyText('codex-switch login ${p.name}')" class="switch-btn">Sign In: codex-switch login ${p.name}</button>`;
-        } else {
-          actionBtn = `<button onclick="switchProfile('${p.name}')" class="primary switch-btn">Switch to ${p.name}</button>`;
-        }
-
-        card.innerHTML = `
-          <div>
-            <div class="card-top">
-              <div class="prof-name">
-                ${p.name}
-                ${p.is_active ? '<span class="active-pill">ACTIVE</span>' : ''}
-              </div>
-              <span class="status-badge ${p.badge_color}">${p.badge_text}</span>
-            </div>
-            <div class="account-meta">
-              ${p.email} <span class="plan-chip">${p.plan_label}</span>
-              ${p.is_alias ? `<div style="font-size:11px; margin-top:3px;">Alias of ${p.alias_of}</div>` : ''}
-            </div>
-            ${primaryHtml}
-            ${secondaryHtml}
-            ${creditsHtml}
-          </div>
-          <div>
-            ${actionBtn}
-          </div>
-        `;
-        grid.appendChild(card);
-      });
-    }
-
-    document.getElementById('autoRefresh').addEventListener('change', e => {
-      if (e.target.checked) {
-        timer = setInterval(loadDashboard, 30000);
-      } else {
-        clearInterval(timer);
-      }
-    });
-
-    loadDashboard();
-    timer = setInterval(loadDashboard, 30000);
-  </script>
-</body>
-</html>
-"""
+def run_watch_loop(home_dir, codex_bin, interval=5, focus_profile=None):
+    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    try:
+        while True:
+            data = fetch_all_profiles_dashboard(home_dir, codex_bin, no_cache=True)
+            output = render_terminal(data, use_color=use_color, focus_profile=focus_profile)
+            if use_color:
+                sys.stdout.write("\033[2J\033[H")
+            sys.stdout.write(output)
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nExiting watch mode.")
 
 
 def switch_profile_action(profile_name, home_dir, codex_bin):
     if not valid_profile_name(profile_name):
-        return False, f"Invalid profile name: {profile_name}"
+        return False, f"invalid profile name: {profile_name}"
     profile_home = os.path.join(home_dir, f".codex-{profile_name}")
-    if not os.path.isdir(profile_home):
-        return False, f"Profile directory does not exist: {profile_name}"
+    if not os.path.isdir(profile_home) or os.path.islink(profile_home):
+        return False, f"profile directory does not exist: {profile_name}"
     auth_file = os.path.join(profile_home, "auth.json")
     if not os.path.isfile(auth_file) or os.path.getsize(auth_file) == 0:
-        return False, f"Profile is not signed in: {profile_name}"
+        return False, f"profile is not signed in: {profile_name}"
 
     cmd_path = os.path.join(os.path.dirname(__file__), "codex-switch.cmd")
     if os.name == "nt" and os.path.isfile(cmd_path):
@@ -958,9 +777,7 @@ def switch_profile_action(profile_name, home_dir, codex_bin):
         if codex_bin:
             env["CODEX_SWITCH_CODEX_BIN"] = codex_bin
         res = subprocess.run([cmd_path, "switch", profile_name], env=env, capture_output=True, text=True)
-        if res.returncode == 0:
-            return True, None
-        return False, res.stderr.strip() or res.stdout.strip()
+        return (res.returncode == 0, res.stderr.strip() or res.stdout.strip() if res.returncode != 0 else None)
 
     script_path = os.path.join(os.path.dirname(__file__), "codex-switch")
     if os.path.isfile(script_path):
@@ -969,11 +786,8 @@ def switch_profile_action(profile_name, home_dir, codex_bin):
         if codex_bin:
             env["CODEX_SWITCH_CODEX_BIN"] = codex_bin
         res = subprocess.run([script_path, "switch", profile_name], env=env, capture_output=True, text=True)
-        if res.returncode == 0:
-            return True, None
-        return False, res.stderr.strip() or res.stdout.strip()
+        return (res.returncode == 0, res.stderr.strip() or res.stdout.strip() if res.returncode != 0 else None)
 
-    # Fallback to direct marker write if shell script is unavailable
     marker_path = os.path.join(home_dir, ".codex", ".codex-switch-active")
     tmp_path = marker_path + f".tmp.{os.getpid()}"
     try:
@@ -986,112 +800,68 @@ def switch_profile_action(profile_name, home_dir, codex_bin):
         return False, str(e)
 
 
-class DashboardHandler(http.server.BaseHTTPRequestHandler):
-    home_dir = None
-    codex_bin = "codex"
+def handle_auto_rotate(data, home_dir, codex_bin, as_json=False):
+    summ = data.get("summary") or {}
+    recommended = summ.get("recommended")
+    reason = summ.get("recommended_reason")
+    detail = summ.get("recommended_detail")
+    active_profile = data.get("active_profile")
 
-    def log_message(self, format, *args):
-        # Suppress noisy HTTP request logging
-        pass
-
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/api/status":
-            data = fetch_all_profiles_dashboard(self.home_dir, self.codex_bin)
-            payload = json.dumps(data).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-        elif parsed.path in ("/", "/index.html"):
-            payload = HTML_PAGE.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+    if not recommended:
+        if as_json:
+            print(json.dumps({
+                "success": False,
+                "error": "No usable profiles available to rotate",
+                "active_profile": active_profile,
+            }, indent=2))
         else:
-            self.send_response(404)
-            self.end_headers()
-
-    def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/api/switch":
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_len)
-            try:
-                req_json = json.loads(body.decode("utf-8"))
-                target_prof = req_json.get("profile")
-            except Exception:
-                target_prof = None
-
-            if not target_prof:
-                resp = {"success": False, "error": "Profile name is required"}
-            else:
-                ok, err = switch_profile_action(target_prof, self.home_dir, self.codex_bin)
-                resp = {"success": ok, "error": err, "active": target_prof if ok else None}
-
-            payload = json.dumps(resp).encode("utf-8")
-            self.send_response(200 if resp["success"] else 400)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-
-def start_web_server(home_dir, codex_bin, host="127.0.0.1", port=8420, open_browser=True):
-    DashboardHandler.home_dir = home_dir
-    DashboardHandler.codex_bin = codex_bin
-
-    chosen_port = port
-    server = None
-    for p in range(port, port + 20):
-        try:
-            server = http.server.ThreadingHTTPServer((host, p), DashboardHandler)
-            chosen_port = p
-            break
-        except OSError:
-            continue
-
-    if not server:
-        sys.stderr.write(f"codex-switch: could not bind web server to {host} on ports {port}-{port+20}\n")
+            print("codex-switch: no usable profiles available to rotate (all profiles signed out or offline)", file=sys.stderr)
         sys.exit(1)
 
-    url = f"http://{host}:{chosen_port}"
-    print(f"\n⚡ Codex Profile Dashboard running at: {url}")
-    print("Press Ctrl+C to stop the dashboard server.\n")
+    if recommended == active_profile:
+        if as_json:
+            print(json.dumps({
+                "success": True,
+                "switched": False,
+                "active_profile": active_profile,
+                "reason": reason,
+                "detail": detail,
+            }, indent=2))
+        else:
+            if reason == "reset_time":
+                print(f"codex-switch: all profiles are rate-limited; already on '{active_profile}' ({detail})")
+            else:
+                print(f"codex-switch: already on best profile '{active_profile}' ({detail})")
+        sys.exit(0)
 
-    if open_browser:
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
+    ok, err = switch_profile_action(recommended, home_dir, codex_bin)
+    if not ok:
+        if as_json:
+            print(json.dumps({
+                "success": False,
+                "error": err or "Switch action failed",
+                "active_profile": active_profile,
+                "target_profile": recommended,
+            }, indent=2))
+        else:
+            print(f"codex-switch: could not switch to profile '{recommended}': {err}", file=sys.stderr)
+        sys.exit(1)
 
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopping dashboard server...")
-    finally:
-        server.server_close()
-
-
-def run_watch_loop(home_dir, codex_bin, interval=5, focus_profile=None):
-    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-    try:
-        while True:
-            data = fetch_all_profiles_dashboard(home_dir, codex_bin)
-            output = render_terminal(data, use_color=use_color, focus_profile=focus_profile)
-            if use_color:
-                sys.stdout.write("\033[2J\033[H")
-            sys.stdout.write(output)
-            sys.stdout.flush()
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        print("\nExiting watch mode.")
+    if as_json:
+        print(json.dumps({
+            "success": True,
+            "switched": True,
+            "active_profile": recommended,
+            "previous_profile": active_profile,
+            "reason": reason,
+            "detail": detail,
+        }, indent=2))
+    else:
+        if reason == "reset_time":
+            print(f"All profiles rate-limited. Switched to Codex profile: {recommended} ({detail})")
+        else:
+            print(f"Switched to Codex profile: {recommended} ({detail})")
+    sys.exit(0)
 
 
 def main():
@@ -1101,26 +871,42 @@ def main():
     parser.add_argument("--home-dir", default=os.environ.get("HOME", os.path.expanduser("~")), help="User home directory")
     parser.add_argument("--dashboard", "-d", action="store_true", help="Display profile limits dashboard")
     parser.add_argument("--all", "-a", action="store_true", help="Display all profiles in dashboard")
-    parser.add_argument("--web", "-w", action="store_true", help="Launch interactive browser dashboard / homepage")
-    parser.add_argument("--port", type=int, default=8420, help="Web server port")
-    parser.add_argument("--host", default="127.0.0.1", help="Web server host")
-    parser.add_argument("--no-browser", action="store_true", help="Do not automatically open browser in web mode")
     parser.add_argument("--json", action="store_true", help="Emit JSON output")
     parser.add_argument("--watch", "-W", action="store_true", help="Live auto-refresh terminal dashboard")
     parser.add_argument("--interval", type=int, default=5, help="Refresh interval in seconds for watch mode")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color output")
+    parser.add_argument("--no-cache", "-f", "--refresh", action="store_true", help="Bypass quota cache and query fresh limits")
+    parser.add_argument("--cache-ttl", type=int, default=60, help="Quota cache TTL in seconds (default: 60)")
+    parser.add_argument("--diagnose", nargs=2, metavar=("CODEX_BIN", "PROFILE"), help="Diagnose auth failure for profile")
+    parser.add_argument("--next", "--auto", dest="auto_rotate", action="store_true", help="Automatically switch to the profile with highest quota (or shortest reset time)")
 
     args = parser.parse_args()
 
-    if args.web:
-        start_web_server(args.home_dir, args.codex_bin, host=args.host, port=args.port, open_browser=not args.no_browser)
+    if args.profile in ("next", "auto"):
+        args.auto_rotate = True
+        args.profile = None
+
+    if args.diagnose:
+        try:
+            diagnose(args.diagnose[0], args.diagnose[1])
+        except (OSError, ValueError, TypeError):
+            pass
         return
 
     if args.watch:
         run_watch_loop(args.home_dir, args.codex_bin, interval=args.interval, focus_profile=args.profile)
         return
 
-    data = fetch_all_profiles_dashboard(args.home_dir, args.codex_bin)
+    data = fetch_all_profiles_dashboard(
+        args.home_dir,
+        args.codex_bin,
+        no_cache=args.no_cache,
+        cache_ttl=args.cache_ttl,
+    )
+
+    if args.auto_rotate:
+        handle_auto_rotate(data, args.home_dir, args.codex_bin, as_json=args.json)
+        return
 
     if args.json:
         if args.profile:
