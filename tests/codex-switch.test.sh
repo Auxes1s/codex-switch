@@ -141,7 +141,7 @@ assert_text_equals "$test_home/.codex-new" "$(sed -n '1p' "${capture_base}.home"
 assert_arg 'login' 3 'login omitted the Codex login subcommand'
 assert_arg '--device-auth' 4 'login lost its argument'
 assert_text_equals 'new-auth' "$(sed -n '1p' "$test_home/.codex-new/auth.json")" 'login did not store auth in the profile'
-mode=$(stat -f '%Lp' "$test_home/.codex-new/auth.json" 2>/dev/null || stat -c '%a' "$test_home/.codex-new/auth.json")
+mode=$(stat -c '%a' "$test_home/.codex-new/auth.json" 2>/dev/null || stat -f '%Lp' "$test_home/.codex-new/auth.json")
 assert_text_equals '600' "$mode" 'profile credentials do not have mode 600'
 assert_text_equals 'new' "$(HOME="$test_home" "$command_path" current)" 'login did not select its profile'
 
