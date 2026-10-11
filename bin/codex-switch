@@ -14,6 +14,8 @@ Usage: codex-switch <profile>
        codex-switch auth <profile> [codex login arguments...]
        codex-switch logout <profile>
        codex-switch status [<profile>]
+       codex-switch dashboard [--web] [--json] [--watch] [<profile>]
+       codex-switch home [--web] [--json] [--watch] [<profile>]
        codex-switch remove <profile>
        codex-switch list
        codex-switch current
@@ -33,7 +35,7 @@ fail() {
 
 valid_profile_name() {
     case $1 in
-        ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*|add|auth|current|help|list|login|logout|remove|run|shell-init|status|switch) return 1 ;;
+        ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*|add|auth|current|dashboard|help|home|list|login|logout|remove|run|shell-init|status|switch) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -338,10 +340,11 @@ case $command_name in
     current|list|shell-init)
         [ "$#" -eq 1 ] || fail "${command_name} does not accept arguments" 64
         ;;
+    dashboard|home)
+        ;;
     run)
         ;;
     status)
-        [ "$#" -le 2 ] || fail 'status accepts at most one profile' 64
         ;;
     *)
         [ "$#" -eq 1 ] || fail 'expected exactly one profile argument' 64
@@ -426,7 +429,40 @@ EOF
         write_marker "$profile"
         printf 'Selected Codex profile: %s\n' "$profile"
         ;;
+    dashboard|home)
+        shift
+        dashboard_helper=${CODEX_SWITCH_DASHBOARD_HELPER-"${script_dir}/codex-switch-dashboard.py"}
+        [ -f "$dashboard_helper" ] || fail "could not find dashboard helper: ${dashboard_helper}"
+        if [ -n "${CODEX_SWITCH_PYTHON-}" ]; then
+            python_command=$CODEX_SWITCH_PYTHON
+        elif command -v python3 >/dev/null 2>&1; then
+            python_command=python3
+        elif command -v python >/dev/null 2>&1; then
+            python_command=python
+        else
+            fail 'Python 3 is required for the profile dashboard'
+        fi
+        find_codex
+        exec "$python_command" "$dashboard_helper" --codex-bin "$codex_command" "$@"
+        ;;
     status)
+        if [ "$#" -ge 2 ] && { [ "$2" = "--dashboard" ] || [ "$2" = "--all" ] || [ "$2" = "-d" ] || [ "$2" = "--web" ] || [ "$2" = "-w" ] || [ "$2" = "--json" ]; }; then
+            flag=$2
+            shift 2
+            dashboard_helper=${CODEX_SWITCH_DASHBOARD_HELPER-"${script_dir}/codex-switch-dashboard.py"}
+            [ -f "$dashboard_helper" ] || fail "could not find dashboard helper: ${dashboard_helper}"
+            if [ -n "${CODEX_SWITCH_PYTHON-}" ]; then
+                python_command=$CODEX_SWITCH_PYTHON
+            elif command -v python3 >/dev/null 2>&1; then
+                python_command=python3
+            elif command -v python >/dev/null 2>&1; then
+                python_command=python
+            else
+                fail 'Python 3 is required for the profile dashboard'
+            fi
+            find_codex
+            exec "$python_command" "$dashboard_helper" --codex-bin "$codex_command" "$flag" "$@"
+        fi
         if [ "$#" -eq 2 ]; then
             profile=$2
             require_profile_name "$profile"

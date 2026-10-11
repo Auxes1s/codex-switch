@@ -15,6 +15,8 @@ Usage: codex-switch <profile>
        codex-switch auth <profile> [codex login arguments...]
        codex-switch logout <profile>
        codex-switch status [<profile>]
+       codex-switch dashboard [--web] [--json] [--watch] [<profile>]
+       codex-switch home [--web] [--json] [--watch] [<profile>]
        codex-switch remove <profile>
        codex-switch list
        codex-switch current
@@ -38,7 +40,7 @@ function Stop-WithError([string] $Message, [int] $ExitCode = 1) {
 
 function Test-ValidProfileName([AllowNull()][AllowEmptyString()][string] $Name) {
     if ([string]::IsNullOrEmpty($Name) -or $Name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or $Name.EndsWith('.')) { return $false }
-    return @('add','auth','current','help','list','login','logout','remove','run','shell-init','status','switch') -notcontains $Name.ToLowerInvariant()
+    return @('add','auth','current','dashboard','help','home','list','login','logout','remove','run','shell-init','status','switch') -notcontains $Name.ToLowerInvariant()
 }
 
 function Assert-ProfileName([string] $Name) {
@@ -485,6 +487,7 @@ try {
         $profile = $arguments[1]; Assert-ProfileName $profile
     } elseif (@('current','list','shell-init') -contains $command) {
         if ($arguments.Count -ne 1) { Stop-WithError "$command does not accept arguments" 64 }
+    } elseif (@('dashboard','home') -contains $command) {
     } elseif ($command -eq 'status') {
         if ($arguments.Count -gt 2) { Stop-WithError 'status accepts at most one profile' 64 }
     } elseif ($command -ne 'run') {
@@ -553,7 +556,23 @@ try {
             Enable-CodexInCurrentPowerShell
             "Selected Codex profile: $profile"; break
         }
+        { $_ -in @('dashboard','home') } {
+            $dashboardHelper = Join-Path $PSScriptRoot 'codex-switch-dashboard.py'
+            if (-not [IO.File]::Exists($dashboardHelper)) { Stop-WithError "could not find dashboard helper: $dashboardHelper" }
+            $dashArgs = @($arguments | Select-Object -Skip 1)
+            $py = if ($env:CODEX_SWITCH_PYTHON) { $env:CODEX_SWITCH_PYTHON } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } elseif (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { Stop-WithError 'Python 3 is required for the profile dashboard' }
+            & $py $dashboardHelper --codex-bin $script:CodexBinary @dashArgs
+            exit $LASTEXITCODE
+        }
         'status' {
+            if ($arguments.Count -ge 2 -and ($arguments[1] -in @('--dashboard', '--all', '-d', '--web', '-w', '--json'))) {
+                $dashboardHelper = Join-Path $PSScriptRoot 'codex-switch-dashboard.py'
+                if (-not [IO.File]::Exists($dashboardHelper)) { Stop-WithError "could not find dashboard helper: $dashboardHelper" }
+                $dashArgs = @($arguments | Select-Object -Skip 1)
+                $py = if ($env:CODEX_SWITCH_PYTHON) { $env:CODEX_SWITCH_PYTHON } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } elseif (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { Stop-WithError 'Python 3 is required for the profile dashboard' }
+                & $py $dashboardHelper --codex-bin $script:CodexBinary @dashArgs
+                exit $LASTEXITCODE
+            }
             $profile = if ($arguments.Count -eq 2) { $arguments[1] } else { $script:ActiveProfile }
             if (-not $profile) { Stop-WithError 'no active profile' }
             Assert-ProfileName $profile

@@ -202,9 +202,11 @@ CODEX_SWITCH_INSTALL_DIR="$install_dir" "$installer_path" >/dev/null
 assert_file_equals "$command_path" "$install_dir/codex-switch" 'installer copied different content'
 assert_file_equals "$repo_dir/bin/codex-switch-migrate.py" "$install_dir/codex-switch-migrate.py" 'installer omitted the migration helper'
 assert_file_equals "$repo_dir/bin/codex-switch-diagnose.py" "$install_dir/codex-switch-diagnose.py" 'installer omitted the diagnostic helper'
+assert_file_equals "$repo_dir/bin/codex-switch-dashboard.py" "$install_dir/codex-switch-dashboard.py" 'installer omitted the dashboard helper'
 [ -x "$install_dir/codex-switch" ] || fail 'installed command is not executable'
 
 python3 "$repo_dir/tests/migration.test.py"
 python3 "$repo_dir/tests/diagnostics.test.py"
+python3 "$repo_dir/tests/dashboard.test.py"
 
 printf '%s\n' 'ok - all codex-switch tests passed'

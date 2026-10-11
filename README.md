@@ -128,16 +128,26 @@ Windows `run` passes `--no-daemon` to avoid an unnecessary console process.
 If hooks cause a visible window on your setup, set
 `CODEX_SWITCH_DISABLE_HOOKS=1`; `run --with-hooks` overrides that setting.
 
-## Manage profiles
+## Manage profiles & usage dashboard
 
 ```sh
 codex-switch list
 codex-switch current
 codex-switch status
 codex-switch status work
+codex-switch dashboard
+codex-switch dashboard --web
 codex-switch add client
 codex-switch remove client
 ```
+
+`dashboard` (or `home`) queries Codex for live rate limits, 5-hour and weekly window usage percentages, reset countdowns, and available free reset credits across all configured profiles:
+
+- `codex-switch dashboard`: clean terminal view with progress bars, reset timers, and profile recommendations so you know which accounts have quota available right now.
+- `codex-switch dashboard --web` (or `-w`): launches an interactive browser dashboard / homepage with live auto-refresh, visual progress meters, and one-click profile switching.
+- `codex-switch dashboard --watch`: live-refreshing terminal dashboard.
+- `codex-switch dashboard --json`: machine-readable JSON report of all profiles and limits.
+- `codex-switch status --dashboard`: launches the limits dashboard via `status`.
 
 `add` creates an unsigned profile without cloning credentials. `remove` refuses to
 remove the active profile, deletes its credential file and links managed by this

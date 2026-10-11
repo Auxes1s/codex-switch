@@ -1,4 +1,7 @@
 /codex-switch-windows-profiles*.zip
+/codex-switch-mac*
+/codex-switch-*.zip
+/codex-switch-*.tar.gz
 __pycache__/
 *.pyc
 .DS_Store

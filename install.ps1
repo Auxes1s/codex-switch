@@ -34,7 +34,7 @@ try {
     $installDirectory = Get-NormalizedPath $installDirectory
     [void] [IO.Directory]::CreateDirectory($installDirectory)
 
-    $fileNames = @('codex-switch-migrate.py', 'codex-switch.ps1', 'codex-switch.cmd')
+    $fileNames = @('codex-switch-migrate.py', 'codex-switch-diagnose.py', 'codex-switch-dashboard.py', 'codex-switch.ps1', 'codex-switch.cmd')
     foreach ($fileName in $fileNames) {
         if (-not [IO.File]::Exists((Join-Path (Join-Path $PSScriptRoot 'bin') $fileName))) {
             throw "missing installation source: $fileName"
