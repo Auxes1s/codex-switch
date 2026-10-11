@@ -34,14 +34,14 @@ class DashboardUnitTests(unittest.TestCase):
 
     def test_progress_bar_rendering(self):
         bar_no_color = dashboard.render_progress_bar(50, width=10, color=False)
-        self.assertIn("50%", bar_no_color)
-        self.assertEqual(bar_no_color, "[█████░░░░░]  50%")
+        self.assertIn("50% left", bar_no_color)
+        self.assertEqual(bar_no_color, "[█████░░░░░]  50% left")
 
         bar_zero = dashboard.render_progress_bar(0, width=10, color=False)
-        self.assertEqual(bar_zero, "[░░░░░░░░░░]   0%")
+        self.assertEqual(bar_zero, "[░░░░░░░░░░]   0% left")
 
         bar_hundred = dashboard.render_progress_bar(100, width=10, color=False)
-        self.assertEqual(bar_hundred, "[██████████] 100%")
+        self.assertEqual(bar_hundred, "[██████████] 100% left")
 
     def test_valid_profile_names(self):
         self.assertTrue(dashboard.valid_profile_name("work"))

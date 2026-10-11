@@ -399,7 +399,7 @@ def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7):
     limited_count = sum(1 for p in profiles_data if p["readiness"] == "rate_limited")
     signed_out_count = sum(1 for p in profiles_data if p["readiness"] == "signed_out")
 
-    # Determine recommended profile
+    # Determine recommended profile (highest remaining quota)
     candidates = [
         p for p in profiles_data
         if p["readiness"] in ("ready", "high_usage") and not p["is_alias"]
@@ -407,8 +407,8 @@ def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7):
     candidates.sort(
         key=lambda x: (
             0 if x["primary"] is not None else 1,
-            x["primary"]["used_percent"] if x["primary"] else 999,
-            x["secondary"]["used_percent"] if x["secondary"] else 999,
+            -(x["primary"]["remaining_percent"]) if x["primary"] else 0,
+            -(x["secondary"]["remaining_percent"]) if x["secondary"] else 0,
         )
     )
     best_profile = candidates[0]["name"] if candidates else None
@@ -428,21 +428,21 @@ def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7):
     }
 
 
-def render_progress_bar(used_percent, width=14, color=True):
-    if used_percent is None:
+def render_progress_bar(remaining_percent, width=14, color=True):
+    if remaining_percent is None:
         return "[?             ]"
-    pct = max(0, min(100, int(used_percent)))
+    pct = max(0, min(100, int(remaining_percent)))
     filled = int(round(pct * width / 100))
     bar = "█" * filled + "░" * (width - filled)
     if not color:
-        return f"[{bar}] {pct:>3}%"
-    if pct < 70:
-        c_code = "\033[32m"  # Green
-    elif pct < 90:
-        c_code = "\033[33m"  # Yellow
+        return f"[{bar}] {pct:>3}% left"
+    if pct >= 30:
+        c_code = "\033[32m"  # Green: healthy quota left
+    elif pct >= 10:
+        c_code = "\033[33m"  # Yellow: low quota left
     else:
-        c_code = "\033[31m"  # Red
-    return f"[{c_code}{bar}\033[0m] {pct:>3}%"
+        c_code = "\033[31m"  # Red: critical / exhausted
+    return f"[{c_code}{bar}\033[0m] {pct:>3}% left"
 
 
 def render_terminal(data, use_color=True, focus_profile=None):
@@ -456,7 +456,7 @@ def render_terminal(data, use_color=True, focus_profile=None):
 
     lines = []
     lines.append(f"{c_bold}{c_cyan}================================================================================{c_reset}")
-    lines.append(f"{c_bold}  ⚡ CODEX-SWITCH DASHBOARD • USAGE LIMITS & PROFILE STATUS{c_reset}")
+    lines.append(f"{c_bold}  ⚡ CODEX-SWITCH DASHBOARD • REMAINING QUOTA & LIMITS STATUS{c_reset}")
     lines.append(f"{c_bold}{c_cyan}================================================================================{c_reset}")
 
     active = data.get("active_profile") or "None"
@@ -464,12 +464,12 @@ def render_terminal(data, use_color=True, focus_profile=None):
     lines.append(f"  {c_bold}Active Profile :{c_reset} {c_green}{active}{c_reset}")
     lines.append(
         f"  {c_bold}Readiness      :{c_reset} {c_green}{summ.get('ready', 0)} ready{c_reset} • "
-        f"{c_yellow}{summ.get('high_usage', 0)} high-usage{c_reset} • "
-        f"{c_red}{summ.get('rate_limited', 0)} limited{c_reset} • "
+        f"{c_yellow}{summ.get('high_usage', 0)} low quota{c_reset} • "
+        f"{c_red}{summ.get('rate_limited', 0)} exhausted{c_reset} • "
         f"{c_dim}{summ.get('signed_out', 0)} signed out{c_reset}"
     )
     if summ.get("recommended"):
-        lines.append(f"  {c_bold}Recommended    :{c_reset} Switch to {c_green}{c_bold}{summ.get('recommended')}{c_reset} for fresh limits")
+        lines.append(f"  {c_bold}Recommended    :{c_reset} Switch to {c_green}{c_bold}{summ.get('recommended')}{c_reset} (highest remaining quota)")
     lines.append(f"{c_dim}--------------------------------------------------------------------------------{c_reset}")
 
     profiles = data.get("profiles", [])
@@ -494,14 +494,14 @@ def render_terminal(data, use_color=True, focus_profile=None):
 
             if p["primary"]:
                 pri = p["primary"]
-                bar = render_progress_bar(pri["used_percent"], width=14, color=use_color)
+                bar = render_progress_bar(pri["remaining_percent"], width=14, color=use_color)
                 resets_str = f"Resets {pri['resets_in']}" + (f" ({pri['resets_time']})" if pri["resets_time"] else "")
-                lines.append(f"  {pri['name']:11} : {bar} used ({pri['remaining_percent']}% left) • {resets_str}")
+                lines.append(f"  {pri['name']:11} : {bar} ({pri['used_percent']}% used) • {resets_str}")
             if p["secondary"]:
                 sec = p["secondary"]
-                bar = render_progress_bar(sec["used_percent"], width=14, color=use_color)
+                bar = render_progress_bar(sec["remaining_percent"], width=14, color=use_color)
                 resets_str = f"Resets {sec['resets_in']}" + (f" ({sec['resets_time']})" if sec["resets_time"] else "")
-                lines.append(f"  {sec['name']:11} : {bar} used ({sec['remaining_percent']}% left) • {resets_str}")
+                lines.append(f"  {sec['name']:11} : {bar} ({sec['used_percent']}% used) • {resets_str}")
 
             if p["reset_credits"] > 0:
                 lines.append(f"  Credits     : {c_yellow}{c_bold}✨ {p['reset_credits']} free rate limit reset(s) available{c_reset}")
@@ -847,8 +847,9 @@ HTML_PAGE = """<!DOCTYPE html>
 
         let primaryHtml = '';
         if (p.primary) {
+          const left = p.primary.remaining_percent;
           const used = p.primary.used_percent;
-          const fillClass = used < 70 ? 'green' : (used < 90 ? 'yellow' : 'red');
+          const fillClass = left >= 30 ? 'green' : (left >= 10 ? 'yellow' : 'red');
           primaryHtml = `
             <div class="limit-block">
               <div class="limit-header">
@@ -856,11 +857,11 @@ HTML_PAGE = """<!DOCTYPE html>
                 <span class="reset">Resets ${p.primary.resets_in}</span>
               </div>
               <div class="progress-bar-bg">
-                <div class="progress-bar-fill ${fillClass}" style="width: ${Math.min(100, used)}%;"></div>
+                <div class="progress-bar-fill ${fillClass}" style="width: ${Math.min(100, left)}%;"></div>
               </div>
               <div class="limit-sub">
-                <span>${used}% used</span>
-                <span>${p.primary.remaining_percent}% remaining</span>
+                <span style="font-weight: 600; color: var(--text);">${left}% left</span>
+                <span>(${used}% used)</span>
               </div>
             </div>
           `;
@@ -868,8 +869,9 @@ HTML_PAGE = """<!DOCTYPE html>
 
         let secondaryHtml = '';
         if (p.secondary) {
+          const left = p.secondary.remaining_percent;
           const used = p.secondary.used_percent;
-          const fillClass = used < 70 ? 'green' : (used < 90 ? 'yellow' : 'red');
+          const fillClass = left >= 30 ? 'green' : (left >= 10 ? 'yellow' : 'red');
           secondaryHtml = `
             <div class="limit-block">
               <div class="limit-header">
@@ -877,11 +879,11 @@ HTML_PAGE = """<!DOCTYPE html>
                 <span class="reset">Resets ${p.secondary.resets_in}</span>
               </div>
               <div class="progress-bar-bg">
-                <div class="progress-bar-fill ${fillClass}" style="width: ${Math.min(100, used)}%;"></div>
+                <div class="progress-bar-fill ${fillClass}" style="width: ${Math.min(100, left)}%;"></div>
               </div>
               <div class="limit-sub">
-                <span>${used}% used</span>
-                <span>${p.secondary.remaining_percent}% remaining</span>
+                <span style="font-weight: 600; color: var(--text);">${left}% left</span>
+                <span>(${used}% used)</span>
               </div>
             </div>
           `;
