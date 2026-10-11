@@ -10,10 +10,8 @@ import http.server
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
-import threading
 import time
 import urllib.parse
 import webbrowser
@@ -953,6 +951,16 @@ def switch_profile_action(profile_name, home_dir, codex_bin):
     auth_file = os.path.join(profile_home, "auth.json")
     if not os.path.isfile(auth_file) or os.path.getsize(auth_file) == 0:
         return False, f"Profile is not signed in: {profile_name}"
+
+    cmd_path = os.path.join(os.path.dirname(__file__), "codex-switch.cmd")
+    if os.name == "nt" and os.path.isfile(cmd_path):
+        env = os.environ.copy()
+        if codex_bin:
+            env["CODEX_SWITCH_CODEX_BIN"] = codex_bin
+        res = subprocess.run([cmd_path, "switch", profile_name], env=env, capture_output=True, text=True)
+        if res.returncode == 0:
+            return True, None
+        return False, res.stderr.strip() or res.stdout.strip()
 
     script_path = os.path.join(os.path.dirname(__file__), "codex-switch")
     if os.path.isfile(script_path):

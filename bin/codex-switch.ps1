@@ -561,7 +561,8 @@ try {
             if (-not [IO.File]::Exists($dashboardHelper)) { Stop-WithError "could not find dashboard helper: $dashboardHelper" }
             $dashArgs = @($arguments | Select-Object -Skip 1)
             $py = if ($env:CODEX_SWITCH_PYTHON) { $env:CODEX_SWITCH_PYTHON } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } elseif (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { Stop-WithError 'Python 3 is required for the profile dashboard' }
-            & $py $dashboardHelper --codex-bin $script:CodexBinary @dashArgs
+            $codexBinary = if ($env:CODEX_SWITCH_CODEX_BIN) { $env:CODEX_SWITCH_CODEX_BIN } else { 'codex' }
+            & $py $dashboardHelper --codex-bin $codexBinary @dashArgs
             exit $LASTEXITCODE
         }
         'status' {
@@ -570,7 +571,8 @@ try {
                 if (-not [IO.File]::Exists($dashboardHelper)) { Stop-WithError "could not find dashboard helper: $dashboardHelper" }
                 $dashArgs = @($arguments | Select-Object -Skip 1)
                 $py = if ($env:CODEX_SWITCH_PYTHON) { $env:CODEX_SWITCH_PYTHON } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } elseif (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { Stop-WithError 'Python 3 is required for the profile dashboard' }
-                & $py $dashboardHelper --codex-bin $script:CodexBinary @dashArgs
+                $codexBinary = if ($env:CODEX_SWITCH_CODEX_BIN) { $env:CODEX_SWITCH_CODEX_BIN } else { 'codex' }
+                & $py $dashboardHelper --codex-bin $codexBinary @dashArgs
                 exit $LASTEXITCODE
             }
             $profile = if ($arguments.Count -eq 2) { $arguments[1] } else { $script:ActiveProfile }

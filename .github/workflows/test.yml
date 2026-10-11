@@ -30,6 +30,9 @@ jobs:
       - name: Run SQLite migration tests
         shell: pwsh
         run: python ./tests/migration.test.py
+      - name: Run profile dashboard tests
+        shell: pwsh
+        run: python ./tests/dashboard.test.py
       - name: Verify user PATH installation
         shell: powershell
         run: |

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Exercise multi-profile rate limits dashboard, formatting, and web endpoints."""
 
+import http.server
 import importlib.util
 import json
 import os
 from pathlib import Path
 import tempfile
 import threading
-import time
 import unittest
 import urllib.request
 
@@ -139,7 +139,6 @@ class DashboardUnitTests(unittest.TestCase):
             dashboard.DashboardHandler.home_dir = tmpdir
             dashboard.DashboardHandler.codex_bin = "nonexistent-codex"
 
-            import http.server
             server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), dashboard.DashboardHandler)
             port = server.server_address[1]
             t = threading.Thread(target=server.serve_forever, daemon=True)

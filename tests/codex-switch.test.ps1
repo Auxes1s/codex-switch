@@ -232,7 +232,7 @@ function global:codex { throw 'selected shell function instead of external Codex
     $install = Join-Path $root 'installed\bin'
     $result = Invoke-Process $shell @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$installer,'-NoPathUpdate') @{ CODEX_SWITCH_INSTALL_DIR = $install }
     Assert-Equal '0' ([string] $result.ExitCode) 'installer failed'
-    foreach ($name in @('codex-switch.ps1','codex-switch.cmd','codex-switch-migrate.py')) {
+    foreach ($name in @('codex-switch.ps1', 'codex-switch.cmd', 'codex-switch-migrate.py', 'codex-switch-diagnose.py', 'codex-switch-dashboard.py')) {
         Assert-True ([IO.File]::Exists((Join-Path $install $name))) "installer omitted $name"
     }
     $installedCommand = Join-Path $install 'codex-switch.cmd'

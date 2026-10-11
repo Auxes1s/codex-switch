@@ -197,6 +197,12 @@ assert_file_equals "$test_home/central-auth-original" "$test_home/.codex/auth.js
 shell_init=$(HOME="$test_home" "$command_path" shell-init)
 printf '%s\n' "$shell_init" | grep -F 'command codex-switch run -- "$@"' >/dev/null || fail 'shell-init did not wrap Codex'
 
+dashboard_output=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" "$command_path" dashboard --json)
+printf '%s\n' "$dashboard_output" | grep -F '"profiles":' >/dev/null || fail 'dashboard --json failed to emit JSON profiles'
+
+status_dash_output=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" "$command_path" status --json)
+printf '%s\n' "$status_dash_output" | grep -F '"profiles":' >/dev/null || fail 'status --json failed to emit JSON profiles'
+
 install_dir="${test_root}/installed/bin"
 CODEX_SWITCH_INSTALL_DIR="$install_dir" "$installer_path" >/dev/null
 assert_file_equals "$command_path" "$install_dir/codex-switch" 'installer copied different content'
