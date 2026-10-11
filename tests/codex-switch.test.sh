@@ -73,7 +73,7 @@ set -eu
 printf '%s\n' "$CODEX_HOME" > "${CODEX_SWITCH_CAPTURE}.home"
 printf '%s\n' "$CODEX_SQLITE_HOME" > "${CODEX_SWITCH_CAPTURE}.sqlite-home"
 printf '%s\n' "$@" > "${CODEX_SWITCH_CAPTURE}.args"
-if [ "${OPENAI_API_KEY+x}${CODEX_ACCESS_TOKEN+x}${OPENAI_IDENTITY_TOKEN_FILE+x}${OPENAI_FEDERATION_RULE_ID+x}" ]; then
+if [ "${OPENAI_API_KEY+x}${CODEX_API_KEY+x}${CODEX_ACCESS_TOKEN+x}${OPENAI_IDENTITY_TOKEN_FILE+x}${OPENAI_FEDERATION_RULE_ID+x}" ]; then
     printf '%s\n' 'present' > "${CODEX_SWITCH_CAPTURE}.auth-env"
 else
     printf '%s\n' 'absent' > "${CODEX_SWITCH_CAPTURE}.auth-env"
@@ -103,7 +103,7 @@ assert_text_equals 'personal-auth' "$(sed -n '1p' "$test_home/.codex-personal/au
 
 capture_base="${test_root}/run-work"
 output=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" \
-    CODEX_SWITCH_CAPTURE="$capture_base" CODEX_SWITCH_WRITE_AUTH='work-refreshed' OPENAI_API_KEY='test-key' \
+    CODEX_SWITCH_CAPTURE="$capture_base" CODEX_SWITCH_WRITE_AUTH='work-refreshed' OPENAI_API_KEY='test-key' CODEX_API_KEY='test-key' \
     "$command_path" run work exec 'do the thing')
 assert_text_equals 'codex-stub-ok' "$output" 'run did not execute Codex'
 assert_text_equals "$test_home/.codex-work" "$(sed -n '1p' "${capture_base}.home")" 'run used the wrong CODEX_HOME'
@@ -201,8 +201,10 @@ install_dir="${test_root}/installed/bin"
 CODEX_SWITCH_INSTALL_DIR="$install_dir" "$installer_path" >/dev/null
 assert_file_equals "$command_path" "$install_dir/codex-switch" 'installer copied different content'
 assert_file_equals "$repo_dir/bin/codex-switch-migrate.py" "$install_dir/codex-switch-migrate.py" 'installer omitted the migration helper'
+assert_file_equals "$repo_dir/bin/codex-switch-diagnose.py" "$install_dir/codex-switch-diagnose.py" 'installer omitted the diagnostic helper'
 [ -x "$install_dir/codex-switch" ] || fail 'installed command is not executable'
 
 python3 "$repo_dir/tests/migration.test.py"
+python3 "$repo_dir/tests/diagnostics.test.py"
 
 printf '%s\n' 'ok - all codex-switch tests passed'

@@ -273,11 +273,21 @@ exec_codex() {
     CODEX_SQLITE_HOME=$active_home
     export CODEX_HOME
     export CODEX_SQLITE_HOME
-    unset OPENAI_API_KEY CODEX_ACCESS_TOKEN OPENAI_IDENTITY_TOKEN_FILE OPENAI_FEDERATION_RULE_ID
+    unset OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN OPENAI_IDENTITY_TOKEN_FILE OPENAI_FEDERATION_RULE_ID
 
     # File storage is intentional: auth.json is explicitly namespaced by
     # CODEX_HOME. Each profile therefore owns one refresh-token cache.
-    exec "$codex_command" -c 'cli_auth_credentials_store="file"' "$@"
+    # Keep Codex attached to the terminal, with its output unchanged. On a
+    # failure, ask Codex itself for auth details before adding a recovery hint.
+    "$codex_command" -c 'cli_auth_credentials_store="file"' "$@"
+    codex_exit=$?
+    if [ "$codex_exit" -eq 1 ] && { [ "$command_name" = run ] || [ "$command_name" = status ]; }; then
+        diagnostic_helper="${script_dir}/codex-switch-diagnose.py"
+        if [ -f "$diagnostic_helper" ] && command -v python3 >/dev/null 2>&1; then
+            python3 "$diagnostic_helper" "$codex_command" "$profile" || :
+        fi
+    fi
+    exit "$codex_exit"
 }
 
 case "${1-}" in

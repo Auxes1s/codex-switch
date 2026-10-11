@@ -73,7 +73,7 @@ $encoding = New-Object Text.UTF8Encoding($false)
 [IO.File]::WriteAllText(($env:CODEX_SWITCH_CAPTURE + '.home'), $env:CODEX_HOME + [Environment]::NewLine, $encoding)
 [IO.File]::WriteAllText(($env:CODEX_SWITCH_CAPTURE + '.sqlite-home'), $env:CODEX_SQLITE_HOME + [Environment]::NewLine, $encoding)
 [IO.File]::WriteAllText(($env:CODEX_SWITCH_CAPTURE + '.args'), ($Arguments -join "`n") + "`n", $encoding)
-[IO.File]::WriteAllText(($env:CODEX_SWITCH_CAPTURE + '.wif'), [string]([Environment]::GetEnvironmentVariables().Contains('OPENAI_FEDERATION_RULE_ID')), $encoding)
+[IO.File]::WriteAllText(($env:CODEX_SWITCH_CAPTURE + '.wif'), [string]([Environment]::GetEnvironmentVariables().Contains('OPENAI_FEDERATION_RULE_ID') -or [Environment]::GetEnvironmentVariables().Contains('CODEX_API_KEY')), $encoding)
 if ($Arguments -contains 'login' -and $env:CODEX_SWITCH_LOGIN_DOMAIN) {
     $domain = $env:CODEX_SWITCH_LOGIN_DOMAIN
     $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"sub":"new-work-user","email":"test@' + $domain + '"}')).TrimEnd('=').Replace('+','-').Replace('/','_')
@@ -136,7 +136,7 @@ function global:codex { throw 'selected shell function instead of external Codex
 
     $capture = Join-Path $root 'capture'
     $result = Invoke-Switch $testHome @('run','work','exec','task') @{
-        CODEX_SWITCH_CODEX_BIN = $stub; CODEX_SWITCH_CAPTURE = $capture; CODEX_SWITCH_WRITE_AUTH = 'work-refreshed'
+        CODEX_SWITCH_CODEX_BIN = $stub; CODEX_SWITCH_CAPTURE = $capture; CODEX_SWITCH_WRITE_AUTH = 'work-refreshed'; CODEX_API_KEY = 'test-key'
     }
     Assert-Equal '0' ([string] $result.ExitCode) "run failed: $($result.Stderr)"
     Assert-Equal "$testHome-work" (First-Line "$capture.home") 'run used wrong CODEX_HOME'

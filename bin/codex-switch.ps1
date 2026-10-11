@@ -350,7 +350,7 @@ function Invoke-CodexAtHome([string] $CodexHome, [string[]] $Arguments, [switch]
     $codexCommand = Get-Command $codex -All -ErrorAction SilentlyContinue | Where-Object { $_.CommandType -in @('Application','ExternalScript') } | Select-Object -First 1
     if (-not $codexCommand) { Stop-WithError "could not find Codex executable: $codex" }
     $oldHome = $env:CODEX_HOME; $oldSqliteHome = $env:CODEX_SQLITE_HOME
-    $authVariables = @('OPENAI_API_KEY','CODEX_ACCESS_TOKEN','OPENAI_IDENTITY_TOKEN_FILE','OPENAI_FEDERATION_RULE_ID')
+    $authVariables = @('OPENAI_API_KEY','CODEX_API_KEY','CODEX_ACCESS_TOKEN','OPENAI_IDENTITY_TOKEN_FILE','OPENAI_FEDERATION_RULE_ID')
     $oldAuthVariables = @{}
     try {
         $env:CODEX_HOME = $CodexHome

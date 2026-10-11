@@ -27,7 +27,10 @@ Codex package installation are shared from `~/.codex`. Session transcripts and
 history are also shared from `~/.codex` so every profile can browse and resume
 all local sessions. Codex's runtime databases use the shared
 `CODEX_SQLITE_HOME=~/.codex`, while credentials remain under the profile-specific
-`CODEX_HOME`.
+`CODEX_HOME`. Ambient credential variables (`OPENAI_API_KEY`, `CODEX_API_KEY`,
+`CODEX_ACCESS_TOKEN`, and workload-identity settings) are cleared before Codex
+starts so they cannot override the selected profile. Verified with Codex CLI
+0.162.1.
 
 When shared session state is first enabled, existing profile session files are
 merged into `~/.codex`. Existing SQLite metadata—including titles, projects,
@@ -36,7 +39,8 @@ prefer the newer timestamp; unresolved conflicts stop the merge for review. The
 original profile files and database snapshots are preserved under
 `~/.codex/.codex-switch-legacy-state/` until you remove them yourself. Close
 running Codex sessions before this one-time migration. Python 3 is required for
-the migration only, not for normal profile use afterward.
+the migration and optional authentication diagnostics after a failed launch;
+successful launches do not require Python.
 
 ## Set up profiles
 
@@ -64,6 +68,11 @@ codex-switch login work
 ```
 
 `auth` remains as an alias for `login`.
+On macOS/Linux, a failed launch keeps Codex's original output and exit status.
+When Python 3 is available, the launcher also asks Codex for authentication
+details. A confirmed authentication failure names the profile and its login
+command; revoked sessions include Codex's native refresh error. This diagnostic
+has a six-second deadline and does not run after successful launches.
 On Windows, `login` authenticates in a secured staging home and publishes its
 credentials only after a successful login. To guard a profile by email domain:
 
