@@ -259,6 +259,9 @@ function global:codex { throw 'selected shell function instead of external Codex
         Assert-Equal 'work' (First-Line (Join-Path $rotationHome '.codex-switch-active')) 'rotation selected the wrong profile'
     }
     Assert-Equal $rotationAuthHash (Get-FileHash -LiteralPath (Join-Path "$rotationHome-work" 'auth.json')).Hash 'rotation changed profile credentials'
+    $result = Invoke-Switch $rotationHome @('dashboard','--no-color') @{ CODEX_SWITCH_PYTHON = $python; PYTHONIOENCODING = 'cp1252' }
+    Assert-Equal '0' ([string] $result.ExitCode) "redirected Windows dashboard failed: $($result.Stderr)"
+    Assert-True ($result.Stdout -match 'work') 'redirected dashboard omitted the active profile'
 
     $install = Join-Path $root 'installed\bin'
     $result = Invoke-Process $shell @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$installer,'-NoPathUpdate') @{ CODEX_SWITCH_INSTALL_DIR = $install }

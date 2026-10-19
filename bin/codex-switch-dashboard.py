@@ -908,6 +908,8 @@ def handle_auto_rotate(data, home_dir, codex_bin, as_json=False):
 
 
 def main():
+    if os.name == "nt":
+        sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Codex Profile Usage & Status Dashboard")
     parser.add_argument("profile", nargs="?", help="Specific profile to inspect")
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_SWITCH_CODEX_BIN", "codex"), help="Codex binary path")
