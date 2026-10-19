@@ -232,7 +232,7 @@ function global:codex { throw 'selected shell function instead of external Codex
     $rotationHome = New-Home 'quota rotation with spaces'
     Write-Text (Join-Path $rotationHome '.codex-switch-auth-isolation-v1') 'complete'
     Write-Text (Join-Path $rotationHome '.codex-switch-active') 'personal'
-    $python = (Get-Command python -CommandType Application -ErrorAction Stop).Source
+    $python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $timestamp = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
     $cache = @{}
     foreach ($name in @('personal', 'work')) {
