@@ -2,12 +2,16 @@
 """Exercise multi-profile rate limits dashboard, formatting, and quota caching."""
 
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
 import tempfile
+import sys
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("dashboard", ROOT / "bin" / "codex-switch-dashboard.py")
@@ -16,6 +20,54 @@ spec.loader.exec_module(dashboard)
 
 
 class DashboardUnitTests(unittest.TestCase):
+    def test_live_rpc_and_silent_timeout(self):
+        with tempfile.TemporaryDirectory(prefix="codex rpc spaces ") as tmpdir:
+            root = Path(tmpdir)
+            (root / ".codex-work").mkdir()
+            (root / ".codex-work" / "auth.json").write_text('{}')
+            stub = root / "rpc.py"
+            stub.write_text('''import json, os, sys, time
+if os.environ.get("RPC_TEST_SILENT"):
+    time.sleep(60)
+assert not os.environ.get("OPENAI_API_KEY")
+assert os.environ["CODEX_HOME"].endswith(".codex-work")
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    ident = request["id"]
+    if ident == 1:
+        result = {}
+    elif ident == 2:
+        result = {"account": {"email": "test@example.com", "planType": "plus"}}
+    else:
+        result = {"rateLimits": {"primary": {"usedPercent": 25}}}
+    print(json.dumps({"id": ident, "result": result}), flush=True)
+''', encoding="utf-8")
+            if os.name == "nt":
+                launcher = root / "codex.cmd"
+                launcher.write_text(f'@echo off\n"{sys.executable}" "{stub}" %*\n')
+            else:
+                launcher = root / "codex"
+                launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{stub}" "$@"\n')
+                launcher.chmod(0o755)
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "must-be-scrubbed"}):
+                result = dashboard.query_codex_profile("work", tmpdir, str(launcher), timeout=5)
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["email"], "test@example.com")
+            self.assertEqual(result["rate_limits"]["rateLimits"]["primary"]["usedPercent"], 25)
+            with patch.dict(os.environ, {"RPC_TEST_SILENT": "1"}):
+                start = time.monotonic()
+                result = dashboard.query_codex_profile("work", tmpdir, str(launcher), timeout=0.2)
+                self.assertLess(time.monotonic() - start, 5)
+                self.assertEqual(result["status"], "partial")
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    start = time.monotonic()
+                    dashboard.diagnose(str(launcher), "work", timeout=0.2)
+                self.assertLess(time.monotonic() - start, 5)
+                self.assertEqual(stderr.getvalue(), "")
+
     def test_window_label_formatting(self):
         self.assertEqual(dashboard.format_window_label(300), "5-Hour Limit")
         self.assertEqual(dashboard.format_window_label(10080), "Weekly Limit")

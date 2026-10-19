@@ -229,6 +229,37 @@ function global:codex { throw 'selected shell function instead of external Codex
     Assert-Equal 'gmail.com' (First-Line (Join-Path "$rollbackHome-work" '.codex-switch-expected-domain')) 'failed login changed the domain guard'
     Assert-Equal 'personal' (First-Line $lockedMarker) 'failed login changed selection'
 
+    $rotationHome = New-Home 'quota rotation with spaces'
+    Write-Text (Join-Path $rotationHome '.codex-switch-auth-isolation-v1') 'complete'
+    Write-Text (Join-Path $rotationHome '.codex-switch-active') 'personal'
+    $python = (Get-Command python -CommandType Application -ErrorAction Stop).Source
+    $timestamp = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+    $cache = @{}
+    foreach ($name in @('personal', 'work')) {
+        $used = if ($name -eq 'work') { 10 } else { 90 }
+        $cache[$name] = @{
+            cached_at = $timestamp
+            data = @{
+                status = 'ok'
+                rate_limits = @{
+                    ordinaryUsageAllowed = $true
+                    rateLimits = @{ primary = @{ usedPercent = $used; windowDurationMins = 300; resetsAt = $timestamp + 3600 } }
+                }
+            }
+        }
+    }
+    Write-Text (Join-Path $rotationHome '.quota-cache.json') ($cache | ConvertTo-Json -Compress -Depth 10)
+    $rotationAuthHash = (Get-FileHash -LiteralPath (Join-Path "$rotationHome-work" 'auth.json')).Hash
+    foreach ($rotationCommand in @(@('next','--json'), @('auto','--json'), @('switch','auto','--json'))) {
+        Write-Text (Join-Path $rotationHome '.codex-switch-active') 'personal'
+        $result = Invoke-Switch $rotationHome $rotationCommand @{ CODEX_SWITCH_PYTHON = $python }
+        Assert-Equal '0' ([string] $result.ExitCode) "rotation failed: $($result.Stderr)"
+        $rotation = $result.Stdout | ConvertFrom-Json
+        Assert-True ($rotation.success -and $rotation.switched) 'rotation did not report success'
+        Assert-Equal 'work' (First-Line (Join-Path $rotationHome '.codex-switch-active')) 'rotation selected the wrong profile'
+    }
+    Assert-Equal $rotationAuthHash (Get-FileHash -LiteralPath (Join-Path "$rotationHome-work" 'auth.json')).Hash 'rotation changed profile credentials'
+
     $install = Join-Path $root 'installed\bin'
     $result = Invoke-Process $shell @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$installer,'-NoPathUpdate') @{ CODEX_SWITCH_INSTALL_DIR = $install }
     Assert-Equal '0' ([string] $result.ExitCode) 'installer failed'

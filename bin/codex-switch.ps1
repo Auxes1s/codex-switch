@@ -568,7 +568,7 @@ try {
             $dashArgs = @(if ($arguments[0] -ieq 'switch') { $arguments | Select-Object -Skip 2 } else { $arguments | Select-Object -Skip 1 })
             $py = if ($env:CODEX_SWITCH_PYTHON) { $env:CODEX_SWITCH_PYTHON } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } elseif (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { Stop-WithError 'Python 3 is required for profile auto-rotation' }
             $codexBinary = if ($env:CODEX_SWITCH_CODEX_BIN) { $env:CODEX_SWITCH_CODEX_BIN } else { 'codex' }
-            & $py $dashboardHelper --codex-bin $codexBinary --next @dashArgs
+            & $py $dashboardHelper --home-dir (Split-Path -Parent $script:ActiveHome) --codex-bin $codexBinary --next @dashArgs
             $exitCode = $LASTEXITCODE
             if ($exitCode -eq 0) { Enable-CodexInCurrentPowerShell }
             exit $exitCode
@@ -579,7 +579,7 @@ try {
             $dashArgs = @($arguments | Select-Object -Skip 1)
             $py = if ($env:CODEX_SWITCH_PYTHON) { $env:CODEX_SWITCH_PYTHON } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } elseif (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { Stop-WithError 'Python 3 is required for the profile dashboard' }
             $codexBinary = if ($env:CODEX_SWITCH_CODEX_BIN) { $env:CODEX_SWITCH_CODEX_BIN } else { 'codex' }
-            & $py $dashboardHelper --codex-bin $codexBinary @dashArgs
+            & $py $dashboardHelper --home-dir (Split-Path -Parent $script:ActiveHome) --codex-bin $codexBinary @dashArgs
             exit $LASTEXITCODE
         }
         'status' {
@@ -589,7 +589,7 @@ try {
                 $dashArgs = @($arguments | Select-Object -Skip 1)
                 $py = if ($env:CODEX_SWITCH_PYTHON) { $env:CODEX_SWITCH_PYTHON } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } elseif (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { Stop-WithError 'Python 3 is required for the profile dashboard' }
                 $codexBinary = if ($env:CODEX_SWITCH_CODEX_BIN) { $env:CODEX_SWITCH_CODEX_BIN } else { 'codex' }
-                & $py $dashboardHelper --codex-bin $codexBinary @dashArgs
+                & $py $dashboardHelper --home-dir (Split-Path -Parent $script:ActiveHome) --codex-bin $codexBinary @dashArgs
                 exit $LASTEXITCODE
             }
             $profile = if ($arguments.Count -eq 2) { $arguments[1] } else { $script:ActiveProfile }

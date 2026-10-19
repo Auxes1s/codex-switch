@@ -9,7 +9,9 @@ import glob
 import json
 import os
 import re
-import selectors
+import queue
+import shutil
+import threading
 import subprocess
 import sys
 import time
@@ -116,6 +118,66 @@ def read_local_auth_metadata(profile_dir):
         return {"exists": True, "email": None, "auth_mode": None}
 
 
+def codex_app_server_command(codex_bin):
+    executable = shutil.which(codex_bin) or codex_bin
+    if os.name == "nt" and executable.lower().endswith(".ps1"):
+        shell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
+        if not shell:
+            raise OSError("PowerShell is required to launch a .ps1 Codex shim")
+        return [shell, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", executable, "-c", 'cli_auth_credentials_store="file"', "app-server", "--stdio"]
+    return [executable, "-c", 'cli_auth_credentials_store="file"', "app-server", "--stdio"]
+
+
+def stop_process(process):
+    if process.poll() is None:
+        if os.name == "nt":
+            # npm .cmd and PowerShell shims spawn children that also own the pipes.
+            subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        else:
+            process.terminate()
+        try:
+            process.wait(timeout=0.6)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def process_lines(process, timeout):
+    """Read both pipes within a deadline, including on Windows (no pipe select)."""
+    events = queue.Queue()
+
+    def read_stream(stream):
+        try:
+            for line in iter(stream.readline, b""):
+                events.put((stream, line))
+        finally:
+            events.put((stream, None))
+
+    readers = []
+    for stream in (process.stdout, process.stderr):
+        reader = threading.Thread(target=read_stream, args=(stream,), daemon=True)
+        reader.start()
+        readers.append(reader)
+    deadline = time.monotonic() + timeout
+    remaining_streams = 2
+    try:
+        while remaining_streams and time.monotonic() < deadline:
+            try:
+                stream, line = events.get(timeout=max(0, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if line is None:
+                remaining_streams -= 1
+            else:
+                yield stream, line.decode("utf-8", errors="replace")
+    finally:
+        stop_process(process)
+        for reader in readers:
+            reader.join(timeout=1)
+
+
 def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
     profile_home = os.path.join(home_dir, f".codex-{profile}")
     sqlite_home = os.path.join(home_dir, ".codex")
@@ -143,8 +205,8 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
     ]:
         env.pop(k, None)
 
-    cmd = [codex_bin, "-c", 'cli_auth_credentials_store="file"', "app-server", "--stdio"]
     try:
+        cmd = codex_app_server_command(codex_bin)
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -174,19 +236,19 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
         except OSError:
             pass
 
+    lines = None
     try:
         send_rpc({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "codex-dashboard", "version": "1"}}})
         send_rpc({"method": "initialized"})
         send_rpc({"id": 2, "method": "account/read", "params": {"refreshToken": False}})
         send_rpc({"id": 3, "method": "account/rateLimits/read", "params": {}})
 
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            line_bytes = process.stdout.readline()
-            if not line_bytes:
-                break
+        lines = process_lines(process, timeout)
+        for stream, line in lines:
+            if stream is process.stderr:
+                continue
             try:
-                msg = json.loads(line_bytes.decode("utf-8", errors="replace"))
+                msg = json.loads(line)
             except Exception:
                 continue
 
@@ -212,12 +274,9 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
             if (account_info is not None or auth_failed) and rate_limits_info is not None:
                 break
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=0.6)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+        if lines is not None:
+            lines.close()
+        stop_process(process)
         try:
             process.stdin.close()
             process.stdout.close()
@@ -652,13 +711,12 @@ def has_saved_credentials():
 
 def diagnose(codex, profile, timeout=6):
     process = subprocess.Popen(
-        [codex, "-c", 'cli_auth_credentials_store="file"', "app-server", "--stdio"],
+        codex_app_server_command(codex),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    selector = selectors.DefaultSelector()
-    buffers = {}
+    lines = process_lines(process, timeout)
     auth_failed = False
     reason = None
     fallback_reason = None
@@ -669,63 +727,46 @@ def diagnose(codex, profile, timeout=6):
         process.stdin.flush()
 
     try:
-        for stream in (process.stdout, process.stderr):
-            selector.register(stream, selectors.EVENT_READ)
-            buffers[stream] = b""
         send({"id": 1, "method": "initialize", "params": {
             "clientInfo": {"name": "codex-switch-diagnostic", "version": "1"},
         }})
-        deadline = time.monotonic() + timeout
-        finished = False
-        while selector.get_map() and not finished and time.monotonic() < deadline:
-            for key, _ in selector.select(max(0, deadline - time.monotonic())):
-                stream = key.fileobj
-                data = os.read(stream.fileno(), 65536)
-                if not data:
-                    selector.unregister(stream)
-                    continue
-                buffers[stream] += data
-                while b"\n" in buffers[stream]:
-                    line, buffers[stream] = buffers[stream].split(b"\n", 1)
-                    line = line.decode(errors="replace")
-                    if stream is process.stderr:
-                        if "Failed to refresh token" in line:
-                            match = re.search(r'error_message: Some\("((?:\\.|[^"\\])*)"\)', line)
-                            if match:
-                                reason = json.loads('"' + match[1] + '"')
-                            match = re.search(r'error_code: Some\("([a-z0-9_]+)"\)', line)
-                            if match:
-                                code = match[1]
-                            match = re.search(r"Failed to refresh token: ([A-Za-z ,.']{10,200})$", line.rstrip())
-                            if match and not fallback_reason:
-                                fallback_reason = match[1].strip()
-                        continue
-                    try:
-                        response = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if response.get("id") == 1:
-                        if "error" in response:
-                            finished = True
-                            break
-                        send({"method": "initialized"})
-                        send({"id": 2, "method": "account/read", "params": {"refreshToken": False}})
-                    elif response.get("id") == 2:
-                        message = response.get("error", {}).get("message", "").lower()
-                        auth_failed = "401" in message and "unauthorized" in message
-                        result = response.get("result")
-                        if (not auth_failed and isinstance(result, dict) and result.get("account") is None
-                                and result.get("requiresOpenaiAuth") and has_saved_credentials()):
-                            auth_failed = True
-                        if not auth_failed:
-                            finished = True
-                            break
-                        send({"id": 3, "method": "account/read", "params": {"refreshToken": True}})
-                    elif response.get("id") == 3:
-                        result = response.get("result", {})
-                        if result.get("account"):
-                            auth_failed = False
-                        finished = True
+        for stream, line in lines:
+            if stream is process.stderr:
+                if "Failed to refresh token" in line:
+                    match = re.search(r'error_message: Some\("((?:\\.|[^"\\])*)"\)', line)
+                    if match:
+                        reason = json.loads('"' + match[1] + '"')
+                    match = re.search(r'error_code: Some\("([a-z0-9_]+)"\)', line)
+                    if match:
+                        code = match[1]
+                    match = re.search(r"Failed to refresh token: ([A-Za-z ,.']{10,200})$", line.rstrip())
+                    if match and not fallback_reason:
+                        fallback_reason = match[1].strip()
+                continue
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if response.get("id") == 1:
+                if "error" in response:
+                    break
+                send({"method": "initialized"})
+                send({"id": 2, "method": "account/read", "params": {"refreshToken": False}})
+            elif response.get("id") == 2:
+                message = response.get("error", {}).get("message", "").lower()
+                auth_failed = "401" in message and "unauthorized" in message
+                result = response.get("result")
+                if (not auth_failed and isinstance(result, dict) and result.get("account") is None
+                        and result.get("requiresOpenaiAuth") and has_saved_credentials()):
+                    auth_failed = True
+                if not auth_failed:
+                    break
+                send({"id": 3, "method": "account/read", "params": {"refreshToken": True}})
+            elif response.get("id") == 3:
+                result = response.get("result", {})
+                if result.get("account"):
+                    auth_failed = False
+                break
         if auth_failed:
             print(f"codex-switch: Codex authentication failed for profile '{profile}'.", file=sys.stderr)
             if reason:
@@ -735,13 +776,8 @@ def diagnose(codex, profile, timeout=6):
                 print(f"codex-switch: Codex reports: {fallback_reason}", file=sys.stderr)
             print(f"codex-switch: Sign in again: codex-switch login {profile}", file=sys.stderr)
     finally:
-        selector.close()
-        process.terminate()
-        try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+        lines.close()
+        stop_process(process)
         for stream in (process.stdin, process.stdout, process.stderr):
             stream.close()
 
@@ -774,6 +810,7 @@ def switch_profile_action(profile_name, home_dir, codex_bin):
     cmd_path = os.path.join(os.path.dirname(__file__), "codex-switch.cmd")
     if os.name == "nt" and os.path.isfile(cmd_path):
         env = os.environ.copy()
+        env["CODEX_HOME"] = os.path.join(home_dir, ".codex")
         if codex_bin:
             env["CODEX_SWITCH_CODEX_BIN"] = codex_bin
         res = subprocess.run([cmd_path, "switch", profile_name], env=env, capture_output=True, text=True)
@@ -783,6 +820,7 @@ def switch_profile_action(profile_name, home_dir, codex_bin):
     if os.path.isfile(script_path):
         env = os.environ.copy()
         env["HOME"] = home_dir
+        env["CODEX_HOME"] = os.path.join(home_dir, ".codex")
         if codex_bin:
             env["CODEX_SWITCH_CODEX_BIN"] = codex_bin
         res = subprocess.run([script_path, "switch", profile_name], env=env, capture_output=True, text=True)
