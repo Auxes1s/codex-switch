@@ -144,7 +144,7 @@ def stop_process(process):
             process.wait()
 
 
-def process_lines(process, timeout):
+def process_lines(process, timeout, drain_until=None):
     """Read both pipes within a deadline, including on Windows (no pipe select)."""
     events = queue.Queue()
 
@@ -164,6 +164,8 @@ def process_lines(process, timeout):
     remaining_streams = 2
     try:
         while remaining_streams and time.monotonic() < deadline:
+            if drain_until is not None:
+                deadline = min(deadline, drain_until[0])
             try:
                 stream, line = events.get(timeout=max(0, deadline - time.monotonic()))
             except queue.Empty:
@@ -716,7 +718,8 @@ def diagnose(codex, profile, timeout=6):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    lines = process_lines(process, timeout)
+    drain_until = [float('inf')]
+    lines = process_lines(process, timeout, drain_until)
     auth_failed = False
     reason = None
     fallback_reason = None
@@ -766,7 +769,9 @@ def diagnose(codex, profile, timeout=6):
                 result = response.get("result", {})
                 if result.get("account"):
                     auth_failed = False
-                break
+                # stderr and stdout have independent readers; allow the native
+                # refresh reason emitted before this response to reach the queue.
+                drain_until[0] = time.monotonic() + 0.1
         if auth_failed:
             print(f"codex-switch: Codex authentication failed for profile '{profile}'.", file=sys.stderr)
             if reason:

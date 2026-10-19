@@ -248,12 +248,12 @@ function global:codex { throw 'selected shell function instead of external Codex
             }
         }
     }
-    Write-Text (Join-Path $rotationHome '.quota-cache.json') ($cache | ConvertTo-Json -Compress -Depth 10)
+    Write-Text (Join-Path $rotationHome '.quota-cache.json') (@{ version = 1; profiles = $cache } | ConvertTo-Json -Compress -Depth 10)
     $rotationAuthHash = (Get-FileHash -LiteralPath (Join-Path "$rotationHome-work" 'auth.json')).Hash
     foreach ($rotationCommand in @(@('next','--json'), @('auto','--json'), @('switch','auto','--json'))) {
         Write-Text (Join-Path $rotationHome '.codex-switch-active') 'personal'
         $result = Invoke-Switch $rotationHome $rotationCommand @{ CODEX_SWITCH_PYTHON = $python }
-        Assert-Equal '0' ([string] $result.ExitCode) "rotation failed: $($result.Stderr)"
+        Assert-Equal '0' ([string] $result.ExitCode) "rotation failed: $($result.Stdout) $($result.Stderr)"
         $rotation = $result.Stdout | ConvertFrom-Json
         Assert-True ($rotation.success -and $rotation.switched) 'rotation did not report success'
         Assert-Equal 'work' (First-Line (Join-Path $rotationHome '.codex-switch-active')) 'rotation selected the wrong profile'
