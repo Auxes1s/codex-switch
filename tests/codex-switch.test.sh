@@ -205,7 +205,7 @@ printf '%s\n' "$status_dash_output" | grep -F '"profiles":' >/dev/null || fail '
 
 cache_now=$(python3 -c 'import time; print(int(time.time()))')
 cat > "$test_home/.codex/.quota-cache.json" <<EOF
-{
+{ "version": 1, "profiles": {
   "gig": {
     "cached_at": ${cache_now},
     "data": {
@@ -230,7 +230,7 @@ cat > "$test_home/.codex/.quota-cache.json" <<EOF
       }
     }
   }
-}
+}}
 EOF
 
 printf '%s\n' 'work' > "$test_home/.codex/.codex-switch-active"
@@ -257,6 +257,26 @@ fi
 HOME="$test_home" "$command_path" remove symlink >/dev/null || fail 'removing symlink profile failed'
 [ ! -L "$test_home/.codex-symlink" ] || fail 'symlink was not removed'
 [ -f "$test_home/.codex-gig/auth.json" ] || fail 'removing symlink deleted target auth credentials'
+
+# Login must not follow a profile alias or a shared credential symlink.
+marker_before=$(cat "$test_home/.codex/.codex-switch-active")
+ln -s "$test_home/.codex-gig" "$test_home/.codex-alias"
+if HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" "$command_path" login alias >/dev/null 2>&1; then
+    fail 'login followed a symlink profile home'
+fi
+assert_text_equals "$marker_before" "$(cat "$test_home/.codex/.codex-switch-active")" 'rejected login changed active selection'
+mkdir "$test_home/.codex-linked-auth"
+ln -s "$test_home/.codex-gig/auth.json" "$test_home/.codex-linked-auth/auth.json"
+if HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" "$command_path" status linked-auth >/dev/null 2>&1; then
+    fail 'status followed a credential symlink'
+fi
+chmod 755 "$test_home/.codex-gig"
+chmod 644 "$test_home/.codex-gig/auth.json"
+HOME="$test_home" "$command_path" switch gig >/dev/null
+mode=$(stat -c '%a' "$test_home/.codex-gig" 2>/dev/null || stat -f '%Lp' "$test_home/.codex-gig")
+assert_text_equals '700' "$mode" 'existing profile directory permissions not repaired'
+mode=$(stat -c '%a' "$test_home/.codex-gig/auth.json" 2>/dev/null || stat -f '%Lp' "$test_home/.codex-gig/auth.json")
+assert_text_equals '600' "$mode" 'existing credential permissions not repaired'
 
 install_dir="${test_root}/installed/bin"
 CODEX_SWITCH_INSTALL_DIR="$install_dir" "$installer_path" >/dev/null

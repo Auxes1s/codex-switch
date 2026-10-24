@@ -3,10 +3,10 @@
 [![Test](https://github.com/Auxes1s/codex-switch/actions/workflows/test.yml/badge.svg)](https://github.com/Auxes1s/codex-switch/actions/workflows/test.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](https://github.com/Auxes1s/codex-switch)
 [![Shell](https://img.shields.io/badge/shell-bash%20%7C%20zsh%20%7C%20fish%20%7C%20pwsh-blueviolet)](https://github.com/Auxes1s/codex-switch)
-[![Codex Verified](https://img.shields.io/badge/Codex%20CLI-0.162.1%20%26%200.155.0-success)](https://developers.openai.com/codex/auth)
+[![Codex Verified](https://img.shields.io/badge/Codex%20CLI-0.164.0-success)](https://developers.openai.com/codex/auth)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Zero-token-copying profile manager and usage limits dashboard for OpenAI's Codex CLI.** Switch between personal, work, client, and side-gig ChatGPT accounts instantly—with shared session history, zero token revocation risk, and an interactive rate limits dashboard & web homepage.
+> **Zero-token-copying profile manager and usage limits dashboard for OpenAI's Codex CLI.** Switch between personal, work, client, and side-gig ChatGPT accounts instantly—with shared session history, isolated credential caches, and an interactive rate limits dashboard & web homepage.
 
 ---
 
@@ -32,11 +32,11 @@
 
 ## ✨ Overview & Key Features
 
-When juggling multiple ChatGPT accounts (such as a personal subscription, an enterprise company seat, and a client workspace), traditional credential switching tools copy `auth.json` in and out of `~/.codex`. Because Codex uses rolling OAuth refresh tokens, copying files creates competing token caches that inevitably revoke your login sessions.
+When juggling multiple ChatGPT accounts (such as a personal subscription, an enterprise company seat, and a client workspace), traditional credential switching tools copy `auth.json` in and out of `~/.codex`. Copying refreshed credentials between locations can leave competing caches with stale tokens and lead to authentication failures.
 
-`codex-switch` provides an isolated, production-grade architecture for multi-account management:
+`codex-switch` provides an isolated credential architecture for multi-account management:
 
-- 🔒 **Zero Token Copying**: Each profile owns its dedicated `CODEX_HOME` (`~/.codex-<profile>/auth.json`). Live refresh tokens are refreshed in-place and never duplicated.
+- 🔒 **Zero Token Copying**: Each profile owns its dedicated `CODEX_HOME` (`~/.codex-<profile>/auth.json`). Normal launches let Codex refresh credentials in place without copying them between profiles.
 - 🔄 **Unified Sessions & History**: Session transcripts, conversation rollouts, and search indices are seamlessly shared via `~/.codex`, allowing any profile to view and resume sessions created by another.
 - 📊 **Real-Time Rate Limits Dashboard**: Inspect 5-hour and weekly window usage percentages, live reset countdowns, and available free reset credits across all accounts in a terminal view with visual progress bars.
 - ⚡ **Sub-Second Quota Caching**: Caches rate limit metrics with a 60-second TTL (`~/.codex/.quota-cache.json`) for instant (<50ms) status and dashboard queries without RPC overhead. Use `--refresh` to force fresh checks.
@@ -56,7 +56,7 @@ In legacy workflows, switching profiles involved copying `auth.json` into and ou
 Every copy becomes a competing refresh-token cache:
 1. If a background Codex process, IDE extension, or terminal session refreshes a token in `~/.codex`, the refreshed token is stored only in that location.
 2. The inactive profile retained a stale copy of the older token.
-3. Upon switching back, presenting the stale token invalidates the entire OAuth refresh chain, forcing an unnecessary browser re-authentication.
+3. Upon switching back, stale credentials can fail to refresh and require browser re-authentication. Profile isolation reduces this risk; it cannot prevent server-side revocation or expiry.
 
 `codex-switch` solves this fundamentally:
 ```text
@@ -173,7 +173,7 @@ codex-switch personal
 codex-switch work
 ```
 
-Run one-off commands under a specific profile without changing the active marker:
+Run commands under a specific profile, also selecting it as active:
 ```sh
 codex-switch run personal exec "review pull request #42"
 ```
@@ -318,7 +318,7 @@ To prevent accidentally logging into a personal account when configuring a corpo
 codex-switch login work --expect-domain mycompany.com
 ```
 
-The domain guard is validated on every `switch`, `run`, and `status`. If the profile's token claims point to a different email domain, the operation stops immediately.
+On Windows, the domain guard is validated on every `switch`, `run`, and `status`. If the profile's token claims point to a different email domain, the operation stops immediately.
 
 ### Atomic Staged Logins (Windows)
 
@@ -339,7 +339,7 @@ This guarantees that an API key set in your terminal environment cannot unintent
 
 ## 🩺 Post-Failure Auth Diagnostics
 
-If Codex exits with a failure code, `codex-switch` launches a 6-second non-blocking diagnostic query to Codex's app-server RPC:
+If Codex exits with a failure code, `codex-switch` launches a diagnostic query bounded to approximately 6 seconds plus process cleanup to Codex's app-server RPC:
 
 - **Pinpoints Revocations**: Distinguishes between network errors, configuration issues, and revoked OAuth refresh tokens.
 - **Remediation Commands**: Tells you exactly which profile needs re-authentication:
@@ -348,7 +348,7 @@ If Codex exits with a failure code, `codex-switch` launches a 6-second non-block
   codex-switch: Codex reports: Your session has ended. Please log in again. (refresh_token_invalidated)
   codex-switch: Sign in again: codex-switch login work
   ```
-- **Zero Token Leakage**: Inspects structured error codes and plain-prose messages; raw tokens and full JSON payloads are never echoed to terminal output or logs.
+- **Zero Token Leakage**: Emits only recognized authentication reasons and codes. Unrecognized diagnostic/RPC error text is suppressed; native Codex launch output is preserved.
 - Does not run on successful launches or exit statuses unrelated to auth.
 
 ---
@@ -361,7 +361,7 @@ If Codex exits with a failure code, `codex-switch` launches a 6-second non-block
 | `codex-switch switch <profile>` | Explicit alias to select `<profile>`. |
 | `codex-switch next` | Automatically switches to the profile with the highest quota (or shortest reset time). |
 | `codex-switch auto` | Alias for `next`. |
-| `codex-switch run [<profile>] [--] [args...]` | Runs Codex under `<profile>` (or active profile if omitted). |
+| `codex-switch run [<profile>] [--] [args...]` | Runs Codex under `<profile>` (or active profile if omitted); an explicit profile also selects it as active. |
 | `codex-switch login <profile> [args...]` | Authenticates `<profile>` via browser login flow. Automatically creates profile if missing. |
 | `codex-switch auth <profile> [args...]` | Alias for `login`. |
 | `codex-switch logout <profile>` | Signs out `<profile>` by invoking Codex logout. |
@@ -420,6 +420,14 @@ cd codex-switch
 The installer copies launcher scripts to `%LOCALAPPDATA%\Programs\codex-switch\bin` and automatically appends it to your user `PATH`. Restart your terminal after installing.
 
 ---
+
+## Compatibility check (24 October 2026)
+
+Verified locally with Codex CLI **0.164.0**, matching the npm `latest` release at check time. Live `account/read` and `account/rateLimits/read` succeeded for personal, work, and gig without changing the active work profile. This checks authentication and quota access, not a model-generation request.
+
+The implementation follows the official [credential storage documentation](https://learn.chatgpt.com/docs/auth) and [app-server initialization protocol](https://learn.chatgpt.com/docs/app-server). Dashboard queries wait for initialization, scrub ambient auth variables, use bounded timeouts, and exclude incomplete checks from automatic rotation. POSIX launches reject symlinked profile homes and credential files and restrict existing profile directories/files to modes 700/600. Credentials remain plaintext on disk in the documented file storage mode; shared sessions and configuration remain readable across profiles.
+
+Local POSIX, migration, diagnostics, and dashboard checks pass. Native Windows behavior is covered by CI configuration and was not executed on this Mac.
 
 ## 🧪 Testing
 

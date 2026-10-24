@@ -216,13 +216,13 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
             stderr=subprocess.PIPE,
             env=env,
         )
-    except OSError as e:
+    except OSError:
         return {
             "status": "offline",
             "email": local_meta["email"],
             "plan_type": None,
             "rate_limits": None,
-            "error": f"Failed to execute Codex CLI: {e}",
+            "error": "Failed to execute Codex CLI",
         }
 
     account_info = None
@@ -241,9 +241,6 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
     lines = None
     try:
         send_rpc({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "codex-dashboard", "version": "1"}}})
-        send_rpc({"method": "initialized"})
-        send_rpc({"id": 2, "method": "account/read", "params": {"refreshToken": False}})
-        send_rpc({"id": 3, "method": "account/rateLimits/read", "params": {}})
 
         lines = process_lines(process, timeout)
         for stream, line in lines:
@@ -255,13 +252,20 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
                 continue
 
             msg_id = msg.get("id")
-            if msg_id == 2:
+            if msg_id == 1:
+                if "error" in msg:
+                    error_msg = "Codex app-server initialization failed"
+                    break
+                send_rpc({"method": "initialized"})
+                send_rpc({"id": 2, "method": "account/read", "params": {"refreshToken": False}})
+                send_rpc({"id": 3, "method": "account/rateLimits/read", "params": {}})
+            elif msg_id == 2:
                 if "error" in msg:
                     err = msg.get("error", {})
                     err_text = str(err.get("message", ""))
                     if "401" in err_text or "unauthorized" in err_text.lower():
                         auth_failed = True
-                    error_msg = err_text
+                    error_msg = "Codex account query failed"
                 else:
                     res = msg.get("result") or {}
                     account_info = res.get("account")
@@ -269,7 +273,10 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
                         auth_failed = True
             elif msg_id == 3:
                 if "error" in msg:
-                    error_msg = str(msg.get("error", {}).get("message", ""))
+                    err_text = str(msg.get("error", {}).get("message", ""))
+                    if "401" in err_text or "unauthorized" in err_text.lower():
+                        auth_failed = True
+                    error_msg = "Codex rate limits query failed"
                 else:
                     rate_limits_info = msg.get("result") or {}
 
@@ -304,7 +311,7 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
         email = local_meta["email"]
 
     return {
-        "status": "ok" if rate_limits_info else "partial",
+        "status": "ok" if rate_limits_info and account_info else "partial",
         "email": email,
         "plan_type": plan_type,
         "rate_limits": rate_limits_info,
@@ -317,13 +324,15 @@ def normalize_profile_data(profile_name, raw_data, active_profile, home_dir, now
     is_active = (profile_name == active_profile)
     status_raw = raw_data.get("status", "unknown")
     email = raw_data.get("email") or "Unknown Account"
-    plan_type = raw_data.get("plan_type") or "plus"
+    plan_type = raw_data.get("plan_type") or "unknown"
     plan_label = {
         "plus": "ChatGPT Plus",
         "pro": "ChatGPT Pro",
         "team": "ChatGPT Team",
         "enterprise": "ChatGPT Enterprise",
         "free": "ChatGPT Free",
+        "business": "ChatGPT Business",
+        "unknown": "Plan unknown",
     }.get(plan_type.lower(), f"ChatGPT {plan_type.capitalize()}")
 
     rl_data = raw_data.get("rate_limits") or {}
@@ -353,6 +362,10 @@ def normalize_profile_data(profile_name, raw_data, active_profile, home_dir, now
         readiness = "auth_expired"
         badge_text = "AUTH EXPIRED"
         badge_color = "red"
+    elif status_raw != "ok":
+        readiness = "offline"
+        badge_text = "UNVERIFIED"
+        badge_color = "gray"
     elif not allowed or (pri_used is not None and pri_used >= 100) or (sec_used is not None and sec_used >= 100):
         readiness = "rate_limited"
         badge_text = "RATE LIMITED"
@@ -512,8 +525,8 @@ def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7, no_cache=False,
                         "cached_at": now_epoch,
                         "data": res,
                     }
-                except Exception as e:
-                    results_raw[pname] = {"status": "error", "error": str(e)}
+                except Exception:
+                    results_raw[pname] = {"status": "error", "error": "Codex profile query failed"}
 
         clean_cache = {k: v for k, v in cached_profiles.items() if k in profile_names}
         save_quota_cache(cache_path, clean_cache)
@@ -774,10 +787,16 @@ def diagnose(codex, profile, timeout=6):
                 drain_until[0] = time.monotonic() + 0.1
         if auth_failed:
             print(f"codex-switch: Codex authentication failed for profile '{profile}'.", file=sys.stderr)
-            if reason:
-                detail = " ".join(reason.splitlines())
+            safe_reasons = {
+                "Your session has ended. Please log in again.",
+                "Your access token could not be refreshed. Please log out and sign in again.",
+            }
+            safe_codes = {"refresh_token_invalidated", "refresh_token_expired", "refresh_token_reused"}
+            if reason in safe_reasons:
+                detail = reason
+                code = code if code in safe_codes else None
                 print(f"codex-switch: Codex reports: {detail}" + (f" ({code})" if code else ""), file=sys.stderr)
-            elif fallback_reason:
+            elif fallback_reason in safe_reasons:
                 print(f"codex-switch: Codex reports: {fallback_reason}", file=sys.stderr)
             print(f"codex-switch: Sign in again: codex-switch login {profile}", file=sys.stderr)
     finally:

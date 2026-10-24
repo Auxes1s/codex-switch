@@ -47,8 +47,10 @@ for line in sys.stdin:
             result = {'id': 3, 'result': {'account': {'type': 'chatgpt', 'access_token': 'SECRET'}}}
         else:
             print('unrelated log SECRET', file=sys.stderr, flush=True)
-            if mode == 'revoked':
+            if mode in ('revoked', 'secret-reason'):
                 print('ERROR Failed to refresh token status=401 Unauthorized detail=TokenErrorDetail { error_code: Some("refresh_token_invalidated"), error_message: Some("Your session has ended. Please log in again."), .. }', file=sys.stderr, flush=True)
+            if mode == 'secret-reason':
+                print('ERROR Failed to refresh token detail=TokenErrorDetail { error_code: Some("refresh_token_invalidated"), error_message: Some("refresh token SECRET"), .. }', file=sys.stderr, flush=True)
             if mode == 'null-account':
                 print('2026-10-11T03:54:24Z ERROR codex_login::auth::manager: Failed to refresh token: Your access token could not be refreshed. Please log out and sign in again.', file=sys.stderr, flush=True)
                 print('ERROR Failed to refresh token: {"refresh_token": "SECRET"}', file=sys.stderr, flush=True)
@@ -82,6 +84,11 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertTrue(result.stderr.startswith('native stderr\n'))
         self.assertIn("profile 'gig'", result.stderr)
         self.assertIn('Your session has ended. Please log in again. (refresh_token_invalidated)', result.stderr)
+        self.assertIn('codex-switch login gig', result.stderr)
+        self.assertNotIn('SECRET', result.stderr)
+
+    def test_unrecognized_native_reason_is_not_echoed(self):
+        result = self.run_launcher('secret-reason')
         self.assertIn('codex-switch login gig', result.stderr)
         self.assertNotIn('SECRET', result.stderr)
 

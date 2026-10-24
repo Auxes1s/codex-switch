@@ -11,7 +11,7 @@ import tempfile
 import sys
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("dashboard", ROOT / "bin" / "codex-switch-dashboard.py")
@@ -31,16 +31,24 @@ if os.environ.get("RPC_TEST_SILENT"):
     time.sleep(60)
 assert not os.environ.get("OPENAI_API_KEY")
 assert os.environ["CODEX_HOME"].endswith(".codex-work")
+initialized = False
 for line in sys.stdin:
     request = json.loads(line)
+    if request.get("method") == "initialized":
+        initialized = True
     if "id" not in request:
         continue
     ident = request["id"]
     if ident == 1:
         result = {}
     elif ident == 2:
+        assert initialized
         result = {"account": {"email": "test@example.com", "planType": "plus"}}
     else:
+        assert initialized
+        if os.environ.get("RPC_TEST_SECRET"):
+            print(json.dumps({"id": ident, "error": {"message": "unauthorized 401 refresh_token=SECRET"}}), flush=True)
+            continue
         result = {"rateLimits": {"primary": {"usedPercent": 25}}}
     print(json.dumps({"id": ident, "result": result}), flush=True)
 ''', encoding="utf-8")
@@ -56,6 +64,10 @@ for line in sys.stdin:
             self.assertEqual(result["status"], "ok")
             self.assertEqual(result["email"], "test@example.com")
             self.assertEqual(result["rate_limits"]["rateLimits"]["primary"]["usedPercent"], 25)
+            with patch.dict(os.environ, {"RPC_TEST_SECRET": "1"}):
+                result = dashboard.query_codex_profile("work", tmpdir, str(launcher), timeout=0.2)
+                self.assertEqual(result["status"], "auth_expired")
+                self.assertNotIn("SECRET", json.dumps(result))
             with patch.dict(os.environ, {"RPC_TEST_SILENT": "1"}):
                 start = time.monotonic()
                 result = dashboard.query_codex_profile("work", tmpdir, str(launcher), timeout=0.2)
@@ -67,6 +79,41 @@ for line in sys.stdin:
                     dashboard.diagnose(str(launcher), "work", timeout=0.2)
                 self.assertLess(time.monotonic() - start, 5)
                 self.assertEqual(stderr.getvalue(), "")
+
+    def test_queries_wait_for_initialize_response(self):
+        process = Mock()
+        process.stdin = io.BytesIO()
+        process.stdout = io.BytesIO()
+        process.stderr = io.BytesIO()
+
+        def lines(*args):
+            sent = process.stdin.getvalue().decode().splitlines()
+            self.assertEqual([json.loads(line)["method"] for line in sent], ["initialize"])
+            yield process.stdout, '{"id":1,"result":{}}'
+            sent = process.stdin.getvalue().decode().splitlines()
+            self.assertEqual([json.loads(line)["method"] for line in sent],
+                             ["initialize", "initialized", "account/read", "account/rateLimits/read"])
+            yield process.stdout, '{"id":2,"result":{"account":{"email":"test@example.com"}}}'
+            yield process.stdout, '{"id":3,"result":{"rateLimits":{}}}'
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, ".codex-work").mkdir()
+            Path(tmpdir, ".codex-work", "auth.json").write_text('{}')
+            with patch.object(dashboard.subprocess, "Popen", return_value=process), \
+                    patch.object(dashboard, "process_lines", side_effect=lines), \
+                    patch.object(dashboard, "stop_process"):
+                result = dashboard.query_codex_profile("work", tmpdir, "codex")
+            self.assertEqual(result["status"], "ok")
+
+    def test_unverified_auth_is_never_ready_or_recommended(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, ".codex-work").mkdir()
+            with patch.object(dashboard, "query_codex_profile", return_value={"status": "partial"}):
+                data = dashboard.fetch_all_profiles_dashboard(tmpdir, "codex", no_cache=True)
+            self.assertIsNone(data["summary"]["recommended"])
+            profile = data["profiles"][0]
+            self.assertEqual(profile["readiness"], "offline")
+            self.assertEqual(profile["plan_label"], "Plan unknown")
 
     def test_window_label_formatting(self):
         self.assertEqual(dashboard.format_window_label(300), "5-Hour Limit")

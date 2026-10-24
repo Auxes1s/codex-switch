@@ -183,7 +183,7 @@ prepare_shared_profile_state() {
     done
 
     for candidate_home in "${HOME}"/.codex-*; do
-        [ -d "$candidate_home" ] || continue
+        [ -d "$candidate_home" ] && [ ! -L "$candidate_home" ] || continue
         candidate_profile=${candidate_home##*/.codex-}
         valid_profile_name "$candidate_profile" || continue
         for shared_name in sessions archived_sessions history.jsonl session_index.jsonl transcription-history.jsonl thread-writer-locks; do
@@ -231,7 +231,13 @@ migrate_sqlite_state() {
 }
 
 prepare_profile_home() {
+    [ ! -L "$profile_home" ] || fail "profile home must not be a symlink: ${profile}"
     mkdir -p "$profile_home" || fail "could not create profile: ${profile}"
+    [ ! -L "$profile_home/auth.json" ] || fail "profile credentials must not be a symlink: ${profile}"
+    chmod 700 "$profile_home" || fail "could not protect profile: ${profile}"
+    if [ -f "$profile_home/auth.json" ]; then
+        chmod 600 "$profile_home/auth.json" || fail "could not protect credentials for ${profile}"
+    fi
 
     migrate_sqlite_state
     prepare_shared_profile_state
@@ -408,9 +414,7 @@ EOF
     auth|login)
         shift 2
         profile_home="${HOME}/.codex-${profile}"
-        if [ ! -d "$profile_home" ]; then
-            prepare_profile_home
-        fi
+        prepare_profile_home
         write_marker "$profile"
         exec_codex login "$@"
         ;;
