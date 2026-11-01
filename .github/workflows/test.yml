@@ -12,10 +12,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Run POSIX shell tests
+      - name: Run POSIX, migration, diagnostics, and dashboard tests
         run: ./tests/codex-switch.test.sh
-      - name: Run SQLite migration tests
-        run: python3 ./tests/migration.test.py
 
   windows:
     runs-on: windows-latest

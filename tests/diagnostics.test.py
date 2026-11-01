@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -144,7 +145,8 @@ class DiagnosticsTests(unittest.TestCase):
         try:
             stderr = io.StringIO()
             start = time.monotonic()
-            with contextlib.redirect_stderr(stderr):
+            with contextlib.redirect_stderr(stderr), \
+                    patch.dict(os.environ, {"CODEX_HOME": str(self.home / '.codex-gig')}):
                 module.diagnose(str(self.stub), 'gig', timeout=0.1)
             self.assertLess(time.monotonic() - start, 2)
             self.assertEqual(stderr.getvalue(), '')

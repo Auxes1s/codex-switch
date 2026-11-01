@@ -3,7 +3,7 @@
 [![Test](https://github.com/Auxes1s/codex-switch/actions/workflows/test.yml/badge.svg)](https://github.com/Auxes1s/codex-switch/actions/workflows/test.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](https://github.com/Auxes1s/codex-switch)
 [![Shell](https://img.shields.io/badge/shell-bash%20%7C%20zsh%20%7C%20fish%20%7C%20pwsh-blueviolet)](https://github.com/Auxes1s/codex-switch)
-[![Codex Verified](https://img.shields.io/badge/Codex%20CLI-0.164.0-success)](https://developers.openai.com/codex/auth)
+[![Codex Verified](https://img.shields.io/badge/Codex%20CLI-0.166.0-success)](https://learn.chatgpt.com/docs/auth)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > **Zero-token-copying profile manager and usage limits dashboard for OpenAI's Codex CLI.** Switch between personal, work, client, and side-gig ChatGPT accounts instantly—with shared session history, isolated credential caches, and an interactive rate limits dashboard & web homepage.
@@ -285,6 +285,36 @@ codex-switch dashboard
   codex-switch status --dashboard
   ```
 
+### Authentication maintenance
+
+Codex automatically refreshes ChatGPT credentials during normal use. To renew
+inactive profiles explicitly and verify their account and quota access, run:
+
+```sh
+codex-switch dashboard --refresh-auth
+codex-switch dashboard --refresh-auth work --json
+```
+
+The first command checks all profiles; the second checks only `work`. Both keep
+the active profile selected. Renewal uses Codex's documented
+`account/read` request with `refreshToken: true`; Codex writes replacement tokens
+directly to each profile's existing credential file. The dashboard displays the
+access-token expiry and includes expiry/last-refresh timestamps in JSON, without
+including tokens. Expiry claims are display hints; live RPC checks establish
+whether authentication works.
+
+`--refresh-auth` bypasses the quota cache and exits nonzero if any requested
+profile cannot be verified. Concurrent dashboard and diagnostic checks for the
+same profile are serialized with a file lock. This lock coordinates
+codex-switch helpers; it does not lock other Codex or IDE processes. The option
+cannot be combined with `--watch`, which would repeatedly force token renewal.
+It does not install a background renewal schedule.
+
+Refresh tokens can still expire or be revoked by OpenAI or workspace policy.
+Neither profile isolation nor a successful refresh guarantees permanent access.
+If Codex reports revoked credentials, sign in to that profile again with
+`codex-switch login <profile>`. See the [official authentication documentation](https://learn.chatgpt.com/docs/auth).
+
 ---
 
 ### ⚡ Smart Quota Rotation (`next` / `auto`)
@@ -421,13 +451,15 @@ The installer copies launcher scripts to `%LOCALAPPDATA%\Programs\codex-switch\b
 
 ---
 
-## Compatibility check (24 October 2026)
+## Compatibility check (1 November 2026)
 
-Verified locally with Codex CLI **0.164.0**, matching the npm `latest` release at check time. Live `account/read` and `account/rateLimits/read` succeeded for personal, work, and gig without changing the active work profile. This checks authentication and quota access, not a model-generation request.
+Verified locally with Codex CLI **0.166.0**, matching npm `latest` at check time and the [official release notes](https://learn.chatgpt.com/docs/changelog). Live token renewal, `account/read`, and `account/rateLimits/read` succeeded for four configured profiles without changing the active selection or desktop credentials. The generated 0.166.0 JSON schema confirms the initialization and proactive-refresh parameters used here. These checks cover authentication and quota access; they do not make a model-generation request.
 
-The implementation follows the official [credential storage documentation](https://learn.chatgpt.com/docs/auth) and [app-server initialization protocol](https://learn.chatgpt.com/docs/app-server). Dashboard queries wait for initialization, scrub ambient auth variables, use bounded timeouts, and exclude incomplete checks from automatic rotation. POSIX launches reject symlinked profile homes and credential files and restrict existing profile directories/files to modes 700/600. Credentials remain plaintext on disk in the documented file storage mode; shared sessions and configuration remain readable across profiles.
+The implementation follows the official [credential storage documentation](https://learn.chatgpt.com/docs/auth) and [app-server initialization protocol](https://learn.chatgpt.com/docs/app-server). Dashboard queries wait for initialization and account refresh before reading quota, scrub ambient auth variables, use bounded timeouts, and exclude incomplete checks from automatic rotation. Nullable quota window durations and backend spend-control blocks are handled. Cached success is discarded when credentials are absent or unsafe, including after logout.
 
-Local POSIX, migration, diagnostics, and dashboard checks pass. Native Windows behavior is covered by CI configuration and was not executed on this Mac.
+POSIX launches reject symlinked profile homes and symlinked or hardlinked credentials. Dashboard checks reject linked or non-regular credential files before reading them, including when quota is cached; on POSIX they also verify ownership and enforce modes 700/600. Quota cache temporary files are created privately and published atomically. Credential files and environment files are excluded from Git by default. Credentials remain plaintext on disk in the documented file storage mode; shared sessions and configuration remain readable across profiles.
+
+Local POSIX and SQLite migration checks, 8 diagnostic tests, and 27 dashboard tests pass. Native Windows behavior remains covered by the CI configuration and was not executed on this Mac.
 
 ## 🧪 Testing
 

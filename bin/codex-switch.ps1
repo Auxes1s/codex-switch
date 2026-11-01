@@ -17,7 +17,7 @@ Usage: codex-switch <profile>
        codex-switch auth <profile> [codex login arguments...]
        codex-switch logout <profile>
        codex-switch status [<profile>]
-       codex-switch dashboard [--json] [--watch] [<profile>]
+       codex-switch dashboard [--json] [--watch | --refresh-auth] [<profile>]
        codex-switch home [--json] [--watch] [<profile>]
        codex-switch remove <profile>
        codex-switch list

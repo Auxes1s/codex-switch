@@ -7,6 +7,8 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
+import subprocess
 import tempfile
 import sys
 import time
@@ -20,6 +22,190 @@ spec.loader.exec_module(dashboard)
 
 
 class DashboardUnitTests(unittest.TestCase):
+    def test_refresh_finishes_before_quota_and_reports_new_expiry(self):
+        process = Mock()
+        process.stdin = io.BytesIO()
+        process.stdout = io.BytesIO()
+        process.stderr = io.BytesIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = Path(tmpdir, ".codex-work")
+            profile.mkdir()
+            auth_file = profile / "auth.json"
+            auth_file.write_text('{}')
+
+            def lines(*args):
+                yield process.stdout, '{"id":1,"result":{}}'
+                sent = [json.loads(line) for line in process.stdin.getvalue().decode().splitlines()]
+                self.assertEqual(sent[-1], {"id": 2, "method": "account/read", "params": {"refreshToken": True}})
+                self.assertNotIn("account/rateLimits/read", [r["method"] for r in sent])
+                import base64
+                claims = base64.urlsafe_b64encode(b'{"exp":2000000000}').decode().rstrip('=')
+                auth_file.write_text(json.dumps({"tokens": {"access_token": f"x.{claims}.x", "refresh_token": "SECRET"}}))
+                yield process.stdout, '{"id":2,"result":{"account":{"email":"test@example.com"}}}'
+                sent = [json.loads(line) for line in process.stdin.getvalue().decode().splitlines()]
+                self.assertEqual(sent[-1]["method"], "account/rateLimits/read")
+                yield process.stdout, '{"id":3,"result":{"rateLimits":{}}}'
+
+            with patch.object(dashboard.subprocess, "Popen", return_value=process), \
+                    patch.object(dashboard, "process_lines", side_effect=lines), \
+                    patch.object(dashboard, "stop_process"):
+                result = dashboard.query_codex_profile("work", tmpdir, "codex", refresh_auth=True)
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["auth"]["access_token_expires_at"], 2000000000)
+            self.assertTrue(result["auth"]["refresh_token_present"])
+            self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_explicit_profile_refresh_bypasses_cache_and_preserves_selection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shared = Path(tmpdir, ".codex")
+            shared.mkdir()
+            marker = shared / ".codex-switch-active"
+            marker.write_text("work\n")
+            for name in ("work", "personal"):
+                profile = Path(tmpdir, f".codex-{name}")
+                profile.mkdir()
+                (profile / "auth.json").write_text('{}')
+            dashboard.save_quota_cache(str(shared / ".quota-cache.json"), {
+                "personal": {"cached_at": time.time(), "data": {"status": "ok"}},
+                "work": {"cached_at": time.time(), "data": {"status": "ok"}},
+            })
+            with patch.object(dashboard, "query_codex_profile", return_value={"status": "ok"}) as query:
+                data = dashboard.fetch_all_profiles_dashboard(tmpdir, "codex", refresh_auth=True, profile="personal")
+                query.assert_called_once_with("personal", tmpdir, "codex", 7, True)
+            self.assertEqual([p["name"] for p in data["profiles"]], ["personal"])
+            self.assertEqual(marker.read_text(), "work\n")
+            self.assertIn("work", dashboard.load_quota_cache(str(shared / ".quota-cache.json")))
+
+    def test_unsafe_credentials_never_use_rpc_or_cached_success(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = Path(tmpdir, ".codex-work")
+            profile.mkdir()
+            target = Path(tmpdir, "private-auth.json")
+            target.write_text('{"tokens":{"refresh_token":"SECRET"}}')
+            auth = profile / "auth.json"
+            shared = Path(tmpdir, ".codex")
+            shared.mkdir()
+            for kind in ("symlink", "hardlink", "directory"):
+                with self.subTest(kind=kind):
+                    try:
+                        if kind == "symlink":
+                            auth.symlink_to(target)
+                        elif kind == "hardlink":
+                            os.link(target, auth)
+                        else:
+                            auth.mkdir()
+                    except OSError:
+                        continue  # Windows can require privileges to create symlinks.
+                    try:
+                        dashboard.save_quota_cache(str(shared / ".quota-cache.json"), {
+                            "work": {"cached_at": time.time(), "data": {"status": "ok"}},
+                        })
+                        with patch.object(dashboard.subprocess, "Popen") as launch:
+                            result = dashboard.query_codex_profile("work", tmpdir, "codex")
+                            data = dashboard.fetch_all_profiles_dashboard(tmpdir, "codex")
+                            launch.assert_not_called()
+                        self.assertEqual(result["status"], "error")
+                        self.assertEqual(data["profiles"][0]["readiness"], "offline")
+                        self.assertIsNone(data["summary"]["recommended"])
+                        self.assertNotIn("SECRET", json.dumps(data))
+                    finally:
+                        auth.rmdir() if kind == "directory" else auth.unlink()
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission modes")
+    def test_dashboard_repairs_permissions_without_changing_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = Path(tmpdir, ".codex-work")
+            profile.mkdir(mode=0o755)
+            auth = profile / "auth.json"
+            auth.write_text('{}')
+            auth.chmod(0o644)
+            result = dashboard.query_codex_profile("work", tmpdir, "nonexistent-codex")
+            self.assertEqual(result["status"], "offline")
+            self.assertEqual(stat.S_IMODE(profile.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(auth.stat().st_mode), 0o600)
+            self.assertEqual(auth.read_text(), '{}')
+
+    def test_overlapping_auth_checks_do_not_launch_another_process(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = Path(tmpdir, ".codex-work")
+            profile.mkdir()
+            (profile / "auth.json").write_text('{}')
+            with dashboard.acquire_auth_check_lock(str(profile)):
+                with patch.object(dashboard.subprocess, "Popen") as launch:
+                    result = dashboard.query_codex_profile("work", tmpdir, "codex", refresh_auth=True)
+                    launch.assert_not_called()
+                self.assertEqual(result["status"], "partial")
+            result = dashboard.query_codex_profile("work", tmpdir, "nonexistent-codex")
+            self.assertEqual(result["status"], "offline")
+
+    def test_cached_success_is_discarded_after_logout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, ".codex-work").mkdir()
+            cache_path = str(Path(tmpdir, ".codex", ".quota-cache.json"))
+            dashboard.save_quota_cache(cache_path, {
+                "work": {"cached_at": time.time(), "data": {"status": "ok"}},
+            })
+            data = dashboard.fetch_all_profiles_dashboard(tmpdir, "nonexistent-codex")
+            self.assertEqual(data["profiles"][0]["readiness"], "signed_out")
+            self.assertIsNone(data["summary"]["recommended"])
+            self.assertEqual(dashboard.load_quota_cache(cache_path), {})
+
+    def test_nullable_windows_and_backend_spend_controls(self):
+        raw = {"status": "ok", "rate_limits": {
+            "ordinaryUsageAllowed": None,
+            "rateLimits": {"primary": {"usedPercent": 10, "windowDurationMins": None}},
+        }}
+        data = dashboard.normalize_profile_data("work", raw, "work", "/tmp", time.time())
+        self.assertEqual(data["primary"]["name"], "Usage Limit")
+        self.assertEqual(data["readiness"], "offline")
+        raw["rate_limits"]["rateLimits"]["spendControlReached"] = True
+        data = dashboard.normalize_profile_data("work", raw, "work", "/tmp", time.time())
+        self.assertEqual(data["readiness"], "rate_limited")
+
+    def test_refresh_auth_cli_rejects_repeated_refresh_and_returns_failure(self):
+        command = [sys.executable, str(ROOT / "bin/codex-switch-dashboard.py")]
+        result = subprocess.run(command + ["--refresh-auth", "--watch"], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("one-time operation", result.stderr)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, ".codex-work").mkdir()
+            result = subprocess.run(command + ["--refresh-auth", "--json", "--home-dir", tmpdir],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(json.loads(result.stdout)["profiles"][0]["readiness"], "signed_out")
+
+    def test_malformed_cache_entries_fall_back_to_a_live_check(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = Path(tmpdir, ".codex-work")
+            profile.mkdir()
+            (profile / "auth.json").write_text('{}')
+            cache_path = str(Path(tmpdir, ".codex", ".quota-cache.json"))
+            dashboard.save_quota_cache(cache_path, {
+                "work": {"cached_at": "invalid", "data": {"status": "ok"}},
+            })
+            with patch.object(dashboard, "query_codex_profile", return_value={"status": "partial"}) as query:
+                data = dashboard.fetch_all_profiles_dashboard(tmpdir, "codex")
+                query.assert_called_once()
+            self.assertEqual(data["profiles"][0]["readiness"], "offline")
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission modes")
+    def test_cache_is_private_before_publication_and_cleans_up_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = str(Path(tmpdir, ".quota-cache.json"))
+            replace = os.replace
+
+            def publish(source, destination):
+                self.assertEqual(stat.S_IMODE(os.stat(source).st_mode), 0o600)
+                replace(source, destination)
+
+            with patch.object(dashboard.os, "replace", side_effect=publish):
+                dashboard.save_quota_cache(cache_path, {"work": {"data": {"status": "ok"}}})
+            before = Path(cache_path).read_bytes()
+            with patch.object(dashboard.os, "replace", side_effect=OSError("cannot replace")):
+                dashboard.save_quota_cache(cache_path, {})
+            self.assertEqual(Path(cache_path).read_bytes(), before)
+            self.assertEqual(list(Path(tmpdir).iterdir()), [Path(cache_path)])
+
     def test_live_rpc_and_silent_timeout(self):
         with tempfile.TemporaryDirectory(prefix="codex rpc spaces ") as tmpdir:
             root = Path(tmpdir)
@@ -74,7 +260,8 @@ for line in sys.stdin:
                 self.assertLess(time.monotonic() - start, 5)
                 self.assertEqual(result["status"], "partial")
                 stderr = io.StringIO()
-                with contextlib.redirect_stderr(stderr):
+                with contextlib.redirect_stderr(stderr), \
+                        patch.dict(os.environ, {"CODEX_HOME": str(root / ".codex-work")}):
                     start = time.monotonic()
                     dashboard.diagnose(str(launcher), "work", timeout=0.2)
                 self.assertLess(time.monotonic() - start, 5)
@@ -92,8 +279,10 @@ for line in sys.stdin:
             yield process.stdout, '{"id":1,"result":{}}'
             sent = process.stdin.getvalue().decode().splitlines()
             self.assertEqual([json.loads(line)["method"] for line in sent],
-                             ["initialize", "initialized", "account/read", "account/rateLimits/read"])
+                             ["initialize", "initialized", "account/read"])
             yield process.stdout, '{"id":2,"result":{"account":{"email":"test@example.com"}}}'
+            sent = process.stdin.getvalue().decode().splitlines()
+            self.assertEqual(json.loads(sent[-1])["method"], "account/rateLimits/read")
             yield process.stdout, '{"id":3,"result":{"rateLimits":{}}}'
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -108,6 +297,7 @@ for line in sys.stdin:
     def test_unverified_auth_is_never_ready_or_recommended(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, ".codex-work").mkdir()
+            Path(tmpdir, ".codex-work", "auth.json").write_text('{}')
             with patch.object(dashboard, "query_codex_profile", return_value={"status": "partial"}):
                 data = dashboard.fetch_all_profiles_dashboard(tmpdir, "codex", no_cache=True)
             self.assertIsNone(data["summary"]["recommended"])

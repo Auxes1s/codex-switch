@@ -11,9 +11,11 @@ import os
 import re
 import queue
 import shutil
+import stat
 import threading
 import subprocess
 import sys
+import tempfile
 import time
 
 RESERVED_COMMANDS = {
@@ -43,6 +45,8 @@ def get_active_profile(home_dir):
 
 
 def format_window_label(minutes):
+    if minutes is None:
+        return "Usage Limit"
     if minutes == 300:
         return "5-Hour Limit"
     if minutes == 10080:
@@ -95,15 +99,46 @@ def parse_jwt_claims(id_token):
             payload = parts[1]
             padded = payload + "=" * ((4 - len(payload) % 4) % 4)
             data = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
-            return json.loads(data)
+            claims = json.loads(data)
+            return claims if isinstance(claims, dict) else {}
     except Exception:
         pass
     return {}
 
 
-def read_local_auth_metadata(profile_dir):
+def protect_profile_auth(profile_dir):
+    """Validate credential isolation before reading or launching Codex."""
+    directory = os.lstat(profile_dir)
+    if not stat.S_ISDIR(directory.st_mode) or getattr(directory, "st_file_attributes", 0) & 0x400:
+        raise ValueError("Profile home must be a real directory")
+    if os.name != "nt":
+        if directory.st_uid != os.getuid():
+            raise ValueError("Profile home must belong to the current user")
+        os.chmod(profile_dir, 0o700)
     auth_file = os.path.join(profile_dir, "auth.json")
-    if not os.path.isfile(auth_file) or os.path.getsize(auth_file) == 0:
+    try:
+        credentials = os.lstat(auth_file)
+    except FileNotFoundError:
+        return False
+    if (not stat.S_ISREG(credentials.st_mode) or credentials.st_nlink != 1
+            or getattr(credentials, "st_file_attributes", 0) & 0x400):
+        raise ValueError("Profile credentials must be a regular file without links")
+    if os.name != "nt":
+        if credentials.st_uid != os.getuid():
+            raise ValueError("Profile credentials must belong to the current user")
+        os.chmod(auth_file, 0o600)
+    return credentials.st_size > 0
+
+
+def read_local_auth_metadata(profile_dir):
+    # JWT claims are display hints only. Codex's RPC establishes auth validity.
+    try:
+        exists = protect_profile_auth(profile_dir)
+    except (OSError, ValueError):
+        return {"exists": False, "email": None, "auth_mode": None,
+                "security_error": "Credential isolation check failed; use a private profile directory and an unlinked auth.json"}
+    auth_file = os.path.join(profile_dir, "auth.json")
+    if not exists:
         return {"exists": False, "email": None, "auth_mode": None}
     try:
         with open(auth_file, "r", encoding="utf-8") as f:
@@ -113,7 +148,17 @@ def read_local_auth_metadata(profile_dir):
         id_token = tokens.get("id_token")
         claims = parse_jwt_claims(id_token) if id_token else {}
         email = claims.get("email")
-        return {"exists": True, "email": email, "auth_mode": auth_mode}
+        access_claims = parse_jwt_claims(tokens.get("access_token"))
+        expires_at = access_claims.get("exp")
+        refreshed_at = data.get("last_refresh")
+        try:
+            refreshed_at = datetime.fromisoformat(refreshed_at.replace("Z", "+00:00")).timestamp()
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            refreshed_at = None
+        return {"exists": True, "email": email, "auth_mode": auth_mode,
+                "auth": {"access_token_expires_at": expires_at if type(expires_at) is int else None,
+                         "last_refresh_at": refreshed_at,
+                         "refresh_token_present": bool(tokens.get("refresh_token"))}}
     except Exception:
         return {"exists": True, "email": None, "auth_mode": None}
 
@@ -127,6 +172,34 @@ def codex_app_server_command(codex_bin):
         return [shell, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
                 "-File", executable, "-c", 'cli_auth_credentials_store="file"', "app-server", "--stdio"]
     return [executable, "-c", 'cli_auth_credentials_store="file"', "app-server", "--stdio"]
+
+
+def acquire_auth_check_lock(profile_home):
+    """Only one dashboard/diagnostic may refresh a profile at a time."""
+    path = os.path.join(profile_home, ".codex-switch-auth-check.lock")
+    if os.path.islink(path):
+        raise OSError("Unsafe auth check lock")
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    lock = os.fdopen(descriptor, "r+b")
+    try:
+        metadata = os.fstat(lock.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise OSError("Unsafe auth check lock")
+        if os.name == "nt":
+            import msvcrt
+            if metadata.st_size == 0:
+                lock.write(b"\0")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            os.fchmod(lock.fileno(), 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock
+    except OSError:
+        lock.close()
+        raise
 
 
 def stop_process(process):
@@ -180,12 +253,14 @@ def process_lines(process, timeout, drain_until=None):
             reader.join(timeout=1)
 
 
-def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
+def query_codex_profile(profile, home_dir, codex_bin, timeout=7, refresh_auth=False):
+    if not valid_profile_name(profile):
+        return {"status": "error", "error": "Invalid profile name"}
     profile_home = os.path.join(home_dir, f".codex-{profile}")
     sqlite_home = os.path.join(home_dir, ".codex")
-    auth_file = os.path.join(profile_home, "auth.json")
-
     local_meta = read_local_auth_metadata(profile_home)
+    if local_meta.get("security_error"):
+        return {"status": "error", "error": local_meta["security_error"]}
     if not local_meta["exists"]:
         return {
             "status": "signed_out",
@@ -194,6 +269,11 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
             "rate_limits": None,
             "error": "Profile is not signed in",
         }
+
+    try:
+        auth_lock = acquire_auth_check_lock(profile_home)
+    except OSError:
+        return {"status": "partial", "error": "Auth check unavailable or already running for this profile"}
 
     env = os.environ.copy()
     env["CODEX_HOME"] = profile_home
@@ -217,6 +297,7 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
             env=env,
         )
     except OSError:
+        auth_lock.close()
         return {
             "status": "offline",
             "email": local_meta["email"],
@@ -257,8 +338,7 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
                     error_msg = "Codex app-server initialization failed"
                     break
                 send_rpc({"method": "initialized"})
-                send_rpc({"id": 2, "method": "account/read", "params": {"refreshToken": False}})
-                send_rpc({"id": 3, "method": "account/rateLimits/read", "params": {}})
+                send_rpc({"id": 2, "method": "account/read", "params": {"refreshToken": refresh_auth}})
             elif msg_id == 2:
                 if "error" in msg:
                     err = msg.get("error", {})
@@ -271,6 +351,11 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
                     account_info = res.get("account")
                     if account_info is None and res.get("requiresOpenaiAuth"):
                         auth_failed = True
+                if account_info is None:
+                    break
+                # Finish any requested renewal before reading quota, so both
+                # requests use the latest credentials from the same Codex process.
+                send_rpc({"id": 3, "method": "account/rateLimits/read", "params": {}})
             elif msg_id == 3:
                 if "error" in msg:
                     err_text = str(msg.get("error", {}).get("message", ""))
@@ -279,8 +364,6 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
                     error_msg = "Codex rate limits query failed"
                 else:
                     rate_limits_info = msg.get("result") or {}
-
-            if (account_info is not None or auth_failed) and rate_limits_info is not None:
                 break
     finally:
         if lines is not None:
@@ -292,6 +375,7 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
             process.stderr.close()
         except Exception:
             pass
+        auth_lock.close()
 
     if auth_failed:
         return {
@@ -310,12 +394,17 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7):
     else:
         email = local_meta["email"]
 
+    # Codex may have rotated tokens during the query. Never write or copy them.
+    local_meta = read_local_auth_metadata(profile_home)
+    if local_meta.get("security_error"):
+        return {"status": "error", "error": local_meta["security_error"]}
     return {
         "status": "ok" if rate_limits_info and account_info else "partial",
         "email": email,
         "plan_type": plan_type,
         "rate_limits": rate_limits_info,
         "error": error_msg,
+        "auth": local_meta.get("auth"),
     }
 
 
@@ -366,10 +455,18 @@ def normalize_profile_data(profile_name, raw_data, active_profile, home_dir, now
         readiness = "offline"
         badge_text = "UNVERIFIED"
         badge_color = "gray"
-    elif not allowed or (pri_used is not None and pri_used >= 100) or (sec_used is not None and sec_used >= 100):
+    elif (allowed is False or spend_reached or rate_limits.get("rateLimitReachedType")
+          or (pri_used is not None and pri_used >= 100)
+          or (sec_used is not None and sec_used >= 100)):
         readiness = "rate_limited"
         badge_text = "RATE LIMITED"
         badge_color = "red"
+    elif allowed is None:
+        # Newer Codex versions distinguish unknown permission from an explicit
+        # allowance. Quota percentages alone cannot establish recovery.
+        readiness = "offline"
+        badge_text = "UNVERIFIED"
+        badge_color = "gray"
     elif (pri_used is not None and pri_used >= 80) or (sec_used is not None and sec_used >= 85):
         readiness = "high_usage"
         badge_text = "HIGH USAGE"
@@ -421,6 +518,7 @@ def normalize_profile_data(profile_name, raw_data, active_profile, home_dir, now
         "secondary": secondary_dict,
         "reset_credits": reset_credits_count,
         "error": raw_data.get("error"),
+        "auth": raw_data.get("auth"),
     }
 
 
@@ -430,31 +528,31 @@ def load_quota_cache(cache_path):
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, dict):
-                return data.get("profiles", {})
+            if isinstance(data, dict) and isinstance(data.get("profiles"), dict):
+                return data["profiles"]
     except (OSError, json.JSONDecodeError):
         pass
     return {}
 
 
 def save_quota_cache(cache_path, profiles_cache):
+    tmp_path = None
     try:
         parent = os.path.dirname(cache_path)
         os.makedirs(parent, exist_ok=True)
-        tmp_path = cache_path + f".tmp.{os.getpid()}"
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        descriptor, tmp_path = tempfile.mkstemp(prefix=".quota-cache-", dir=parent)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as f:
             json.dump({
                 "version": 1,
                 "timestamp": time.time(),
                 "profiles": profiles_cache,
             }, f, indent=2)
-        try:
-            os.chmod(tmp_path, 0o600)
-        except OSError:
-            pass
         os.replace(tmp_path, cache_path)
     except OSError:
         pass
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def get_effective_reset_epoch(profile_dict):
@@ -479,41 +577,52 @@ def get_effective_reset_epoch(profile_dict):
         return min(epochs) if epochs else float("inf")
 
 
-def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7, no_cache=False, cache_ttl=60):
+def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7, no_cache=False, cache_ttl=60,
+                                refresh_auth=False, profile=None):
     now_epoch = time.time()
     active_profile = get_active_profile(home_dir)
     cache_path = os.path.join(home_dir, ".codex", ".quota-cache.json")
-    cached_profiles = {} if no_cache else load_quota_cache(cache_path)
+    cached_profiles = load_quota_cache(cache_path)
 
     profile_dirs = glob.glob(os.path.join(home_dir, ".codex-*"))
     profile_names = []
     for pdir in sorted(profile_dirs):
         if not os.path.isdir(pdir) or os.path.islink(pdir):
             continue
-        pname = os.path.basename(pdir).replace(".codex-", "")
-        if valid_profile_name(pname):
+        pname = os.path.basename(pdir)[len(".codex-"):]
+        if valid_profile_name(pname) and (profile is None or pname == profile):
             profile_names.append(pname)
 
     results_raw = {}
     needed = []
     for pname in profile_names:
+        local_meta = read_local_auth_metadata(os.path.join(home_dir, f".codex-{pname}"))
+        if local_meta.get("security_error"):
+            results_raw[pname] = {"status": "error", "error": local_meta["security_error"]}
+            cached_profiles.pop(pname, None)
+            continue
+        if not local_meta["exists"]:
+            results_raw[pname] = {"status": "signed_out"}
+            cached_profiles.pop(pname, None)
+            continue
         entry = cached_profiles.get(pname)
         if (
             not no_cache
+            and not refresh_auth
             and entry
             and isinstance(entry, dict)
-            and "cached_at" in entry
-            and (now_epoch - entry["cached_at"]) < cache_ttl
-            and "data" in entry
+            and isinstance(entry.get("cached_at"), (int, float))
+            and 0 <= (now_epoch - entry["cached_at"]) < cache_ttl
+            and isinstance(entry.get("data"), dict)
         ):
-            results_raw[pname] = entry["data"]
+            results_raw[pname] = dict(entry["data"], auth=local_meta.get("auth"))
         else:
             needed.append(pname)
 
     if needed:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(needed)))) as executor:
             future_to_prof = {
-                executor.submit(query_codex_profile, pname, home_dir, codex_bin, timeout): pname
+                executor.submit(query_codex_profile, pname, home_dir, codex_bin, timeout, refresh_auth): pname
                 for pname in needed
             }
             for future in concurrent.futures.as_completed(future_to_prof):
@@ -528,8 +637,9 @@ def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7, no_cache=False,
                 except Exception:
                     results_raw[pname] = {"status": "error", "error": "Codex profile query failed"}
 
-        clean_cache = {k: v for k, v in cached_profiles.items() if k in profile_names}
-        save_quota_cache(cache_path, clean_cache)
+    clean_cache = {k: v for k, v in cached_profiles.items()
+                   if k in profile_names or profile is not None}
+    save_quota_cache(cache_path, clean_cache)
 
     profiles_data = []
     for pname in profile_names:
@@ -595,6 +705,7 @@ def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7, no_cache=False,
     return {
         "timestamp": now_epoch,
         "active_profile": active_profile,
+        "auth_refresh_requested": refresh_auth,
         "summary": {
             "total": len(profiles_data),
             "ready": ready_count,
@@ -685,6 +796,13 @@ def render_terminal(data, use_color=True, focus_profile=None):
             p_title = f"{act_icon} {c_bold}{p['name']}{c_reset}{act_badge}"
             lines.append(f"\n{p_title}  {badge}")
             lines.append(f"  Account     : {p['email']} {c_dim}({p['plan_label']}){c_reset}")
+            auth = p.get("auth") or {}
+            expires_at = auth.get("access_token_expires_at")
+            if expires_at:
+                expiry = format_countdown(expires_at, data["timestamp"])
+                expiry = "expired" if expiry == "Ready now" else f"expires {expiry}"
+                renewal = "; Codex can renew during use" if auth.get("refresh_token_present") else ""
+                lines.append(f"  Auth        : Access token {expiry}{renewal}")
 
             if p["primary"]:
                 pri = p["primary"]
@@ -725,6 +843,19 @@ def has_saved_credentials():
 
 
 def diagnose(codex, profile, timeout=6):
+    home = os.environ.get("CODEX_HOME")
+    auth_lock = None
+    try:
+        if home:
+            protect_profile_auth(home)
+            auth_lock = acquire_auth_check_lock(home)
+        _diagnose(codex, profile, timeout)
+    finally:
+        if auth_lock:
+            auth_lock.close()
+
+
+def _diagnose(codex, profile, timeout):
     process = subprocess.Popen(
         codex_app_server_command(codex),
         stdin=subprocess.PIPE,
@@ -810,7 +941,7 @@ def run_watch_loop(home_dir, codex_bin, interval=5, focus_profile=None):
     use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     try:
         while True:
-            data = fetch_all_profiles_dashboard(home_dir, codex_bin, no_cache=True)
+            data = fetch_all_profiles_dashboard(home_dir, codex_bin, no_cache=True, profile=focus_profile)
             output = render_terminal(data, use_color=use_color, focus_profile=focus_profile)
             if use_color:
                 sys.stdout.write("\033[2J\033[H")
@@ -940,11 +1071,17 @@ def main():
     parser.add_argument("--interval", type=int, default=5, help="Refresh interval in seconds for watch mode")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color output")
     parser.add_argument("--no-cache", "-f", "--refresh", action="store_true", help="Bypass quota cache and query fresh limits")
+    parser.add_argument("--refresh-auth", action="store_true", help="Ask Codex to renew saved credentials once, bypassing the quota cache")
     parser.add_argument("--cache-ttl", type=int, default=60, help="Quota cache TTL in seconds (default: 60)")
     parser.add_argument("--diagnose", nargs=2, metavar=("CODEX_BIN", "PROFILE"), help="Diagnose auth failure for profile")
     parser.add_argument("--next", "--auto", dest="auto_rotate", action="store_true", help="Automatically switch to the profile with highest quota (or shortest reset time)")
 
     args = parser.parse_args()
+
+    if args.profile and not valid_profile_name(args.profile) and args.profile not in ("next", "auto"):
+        parser.error("invalid profile name")
+    if args.refresh_auth and args.watch:
+        parser.error("--refresh-auth is a one-time operation; run it without --watch")
 
     if args.profile in ("next", "auto"):
         args.auto_rotate = True
@@ -966,6 +1103,8 @@ def main():
         args.codex_bin,
         no_cache=args.no_cache,
         cache_ttl=args.cache_ttl,
+        refresh_auth=args.refresh_auth,
+        profile=args.profile,
     )
 
     if args.auto_rotate:
@@ -977,12 +1116,14 @@ def main():
             filtered = [p for p in data.get("profiles", []) if p["name"] == args.profile]
             data["profiles"] = filtered
         print(json.dumps(data, indent=2))
-        return
-
-    use_color = (sys.stdout.isatty() and not args.no_color and not os.environ.get("NO_COLOR"))
-    output = render_terminal(data, use_color=use_color, focus_profile=args.profile)
-    print(output)
+    else:
+        use_color = (sys.stdout.isatty() and not args.no_color and not os.environ.get("NO_COLOR"))
+        output = render_terminal(data, use_color=use_color, focus_profile=args.profile)
+        print(output)
+    if args.refresh_auth:
+        usable = {"ready", "high_usage", "rate_limited"}
+        return 0 if data["profiles"] and all(p["readiness"] in usable for p in data["profiles"]) else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

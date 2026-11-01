@@ -16,7 +16,7 @@ Usage: codex-switch <profile>
        codex-switch auth <profile> [codex login arguments...]
        codex-switch logout <profile>
        codex-switch status [<profile>]
-       codex-switch dashboard [--json] [--watch] [<profile>]
+       codex-switch dashboard [--json] [--watch | --refresh-auth] [<profile>]
        codex-switch home [--json] [--watch] [<profile>]
        codex-switch remove <profile>
        codex-switch list
@@ -235,7 +235,9 @@ prepare_profile_home() {
     mkdir -p "$profile_home" || fail "could not create profile: ${profile}"
     [ ! -L "$profile_home/auth.json" ] || fail "profile credentials must not be a symlink: ${profile}"
     chmod 700 "$profile_home" || fail "could not protect profile: ${profile}"
-    if [ -f "$profile_home/auth.json" ]; then
+    if [ -e "$profile_home/auth.json" ]; then
+        [ "$(find "$profile_home/auth.json" -prune -type f -links 1 -user "$(id -u)" -print)" = "$profile_home/auth.json" ] ||
+            fail "profile credentials must be an owned regular file without links: ${profile}"
         chmod 600 "$profile_home/auth.json" || fail "could not protect credentials for ${profile}"
     fi
 

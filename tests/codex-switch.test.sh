@@ -270,6 +270,12 @@ ln -s "$test_home/.codex-gig/auth.json" "$test_home/.codex-linked-auth/auth.json
 if HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" "$command_path" status linked-auth >/dev/null 2>&1; then
     fail 'status followed a credential symlink'
 fi
+mkdir "$test_home/.codex-hardlinked-auth"
+ln "$test_home/.codex-gig/auth.json" "$test_home/.codex-hardlinked-auth/auth.json"
+if HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" "$command_path" status hardlinked-auth >/dev/null 2>&1; then
+    fail 'status accepted a hardlinked credential cache'
+fi
+rm "$test_home/.codex-hardlinked-auth/auth.json"
 chmod 755 "$test_home/.codex-gig"
 chmod 644 "$test_home/.codex-gig/auth.json"
 HOME="$test_home" "$command_path" switch gig >/dev/null
