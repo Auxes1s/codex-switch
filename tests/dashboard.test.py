@@ -71,7 +71,7 @@ class DashboardUnitTests(unittest.TestCase):
             })
             with patch.object(dashboard, "query_codex_profile", return_value={"status": "ok"}) as query:
                 data = dashboard.fetch_all_profiles_dashboard(tmpdir, "codex", refresh_auth=True, profile="personal")
-                query.assert_called_once_with("personal", tmpdir, "codex", 7, True)
+                query.assert_called_once_with("personal", tmpdir, "codex", 12, True)
             self.assertEqual([p["name"] for p in data["profiles"]], ["personal"])
             self.assertEqual(marker.read_text(), "work\n")
             self.assertIn("work", dashboard.load_quota_cache(str(shared / ".quota-cache.json")))
@@ -665,6 +665,81 @@ for line in sys.stdin:
 
             data = dashboard.fetch_all_profiles_dashboard(tmpdir, "nonexistent-codex", timeout=1)
             self.assertEqual(data["summary"]["recommended"], "personal")
+
+    def test_failed_and_partial_queries_never_poison_quota_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shared = Path(tmpdir, ".codex")
+            shared.mkdir()
+            cache_file = str(shared / ".quota-cache.json")
+            profile = Path(tmpdir, ".codex-work")
+            profile.mkdir()
+            (profile / "auth.json").write_text('{}')
+
+            # Pre-seed cache with an existing entry
+            dashboard.save_quota_cache(cache_file, {
+                "work": {"cached_at": time.time(), "data": {"status": "ok", "email": "good@example.com"}},
+            })
+
+            # When a live query returns partial (e.g. timeout)
+            with patch.object(dashboard, "query_codex_profile", return_value={"status": "partial"}):
+                dashboard.fetch_all_profiles_dashboard(tmpdir, "codex", no_cache=True)
+
+            # Quota cache must NOT store partial results or poison the cache
+            cached = dashboard.load_quota_cache(cache_file)
+            self.assertNotIn("work", cached)
+
+    def test_rate_limits_fallback_to_rate_limits_by_limit_id(self):
+        # In Codex 0.167+, rateLimitsByLimitId provides per-limit data
+        raw = {
+            "status": "ok",
+            "email": "user@example.com",
+            "plan_type": "promax",
+            "rate_limits": {
+                "ordinaryUsageAllowed": True,
+                "rateLimits": None,
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "primary": {"usedPercent": 40, "windowDurationMins": 300, "resetsAt": 10000},
+                        "secondary": {"usedPercent": 15, "windowDurationMins": 10080, "resetsAt": 20000},
+                    }
+                },
+                "rateLimitResetCredits": {"availableCount": 2},
+            },
+        }
+        data = dashboard.normalize_profile_data("work", raw, "work", "/tmp", 1000)
+        self.assertEqual(data["plan_label"], "ChatGPT Pro Max")
+        self.assertEqual(data["readiness"], "ready")
+        self.assertEqual(data["primary"]["used_percent"], 40)
+        self.assertEqual(data["primary"]["remaining_percent"], 60)
+        self.assertEqual(data["secondary"]["used_percent"], 15)
+        self.assertEqual(data["reset_credits"], 2)
+
+    def test_codex_0_167_plan_types_and_workspace_name(self):
+        plans = [
+            ("promax", "ChatGPT Pro Max"),
+            ("prolite", "ChatGPT Pro Lite"),
+            ("sci", "ChatGPT Science"),
+            ("sci_plus", "ChatGPT Science Plus"),
+            ("edu", "ChatGPT Edu"),
+            ("edu_plus", "ChatGPT Edu Plus"),
+            ("edu_pro", "ChatGPT Edu Pro"),
+        ]
+        for ptype, expected in plans:
+            with self.subTest(plan_type=ptype):
+                raw = {"status": "ok", "plan_type": ptype, "rate_limits": {"ordinaryUsageAllowed": True}}
+                norm = dashboard.normalize_profile_data("work", raw, "work", "/tmp", 1000)
+                self.assertEqual(norm["plan_label"], expected)
+
+        # Team/Enterprise workspace display
+        raw_team = {
+            "status": "ok",
+            "plan_type": "team",
+            "workspace_name": "Acme Corp",
+            "rate_limits": {"ordinaryUsageAllowed": True},
+        }
+        norm_team = dashboard.normalize_profile_data("work", raw_team, "work", "/tmp", 1000)
+        self.assertEqual(norm_team["plan_label"], "ChatGPT Team • Acme Corp")
+        self.assertEqual(norm_team["workspace_name"], "Acme Corp")
 
 
 if __name__ == "__main__":

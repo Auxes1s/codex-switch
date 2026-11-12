@@ -253,7 +253,7 @@ def process_lines(process, timeout, drain_until=None):
             reader.join(timeout=1)
 
 
-def query_codex_profile(profile, home_dir, codex_bin, timeout=7, refresh_auth=False):
+def query_codex_profile(profile, home_dir, codex_bin, timeout=12, refresh_auth=False):
     if not valid_profile_name(profile):
         return {"status": "error", "error": "Invalid profile name"}
     profile_home = os.path.join(home_dir, f".codex-{profile}")
@@ -388,9 +388,11 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7, refresh_auth=Fa
 
     email = None
     plan_type = None
+    workspace_name = None
     if account_info and isinstance(account_info, dict):
         email = account_info.get("email") or local_meta["email"]
         plan_type = account_info.get("planType")
+        workspace_name = account_info.get("workspaceName")
     else:
         email = local_meta["email"]
 
@@ -402,6 +404,7 @@ def query_codex_profile(profile, home_dir, codex_bin, timeout=7, refresh_auth=Fa
         "status": "ok" if rate_limits_info and account_info else "partial",
         "email": email,
         "plan_type": plan_type,
+        "workspace_name": workspace_name,
         "rate_limits": rate_limits_info,
         "error": error_msg,
         "auth": local_meta.get("auth"),
@@ -414,18 +417,38 @@ def normalize_profile_data(profile_name, raw_data, active_profile, home_dir, now
     status_raw = raw_data.get("status", "unknown")
     email = raw_data.get("email") or "Unknown Account"
     plan_type = raw_data.get("plan_type") or "unknown"
+    workspace_name = raw_data.get("workspace_name")
     plan_label = {
         "plus": "ChatGPT Plus",
         "pro": "ChatGPT Pro",
+        "prolite": "ChatGPT Pro Lite",
+        "promax": "ChatGPT Pro Max",
         "team": "ChatGPT Team",
-        "enterprise": "ChatGPT Enterprise",
-        "free": "ChatGPT Free",
         "business": "ChatGPT Business",
+        "self_serve_business_prolite": "ChatGPT Business Pro Lite",
+        "self_serve_business_usage_based": "ChatGPT Business (Usage-Based)",
+        "enterprise": "ChatGPT Enterprise",
+        "ent26": "ChatGPT Enterprise",
+        "enterprise_cbp_automation": "ChatGPT Enterprise (Automation)",
+        "enterprise_cbp_usage_based": "ChatGPT Enterprise (Usage-Based)",
+        "edu": "ChatGPT Edu",
+        "edu_plus": "ChatGPT Edu Plus",
+        "edu_pro": "ChatGPT Edu Pro",
+        "sci": "ChatGPT Science",
+        "sci_plus": "ChatGPT Science Plus",
+        "free": "ChatGPT Free",
+        "go": "ChatGPT Go",
         "unknown": "Plan unknown",
-    }.get(plan_type.lower(), f"ChatGPT {plan_type.capitalize()}")
+    }.get(plan_type.lower(), f"ChatGPT {plan_type.replace('_', ' ').title()}")
+    if workspace_name and plan_type.lower() in (
+        "team", "enterprise", "ent26", "business",
+        "self_serve_business_prolite", "self_serve_business_usage_based",
+        "edu", "edu_plus", "edu_pro",
+    ):
+        plan_label = f"{plan_label} • {workspace_name}"
 
     rl_data = raw_data.get("rate_limits") or {}
-    rate_limits = rl_data.get("rateLimits") or {}
+    rate_limits = rl_data.get("rateLimits") or (rl_data.get("rateLimitsByLimitId") or {}).get("codex") or {}
     primary_rl = rate_limits.get("primary") or {}
     secondary_rl = rate_limits.get("secondary") or {}
     reset_credits_info = rl_data.get("rateLimitResetCredits") or {}
@@ -514,6 +537,7 @@ def normalize_profile_data(profile_name, raw_data, active_profile, home_dir, now
         "email": email,
         "plan_type": plan_type,
         "plan_label": plan_label,
+        "workspace_name": workspace_name,
         "primary": primary_dict,
         "secondary": secondary_dict,
         "reset_credits": reset_credits_count,
@@ -577,7 +601,7 @@ def get_effective_reset_epoch(profile_dict):
         return min(epochs) if epochs else float("inf")
 
 
-def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7, no_cache=False, cache_ttl=60,
+def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=12, no_cache=False, cache_ttl=60,
                                 refresh_auth=False, profile=None):
     now_epoch = time.time()
     active_profile = get_active_profile(home_dir)
@@ -630,12 +654,16 @@ def fetch_all_profiles_dashboard(home_dir, codex_bin, timeout=7, no_cache=False,
                 try:
                     res = future.result()
                     results_raw[pname] = res
-                    cached_profiles[pname] = {
-                        "cached_at": now_epoch,
-                        "data": res,
-                    }
+                    if res.get("status") == "ok":
+                        cached_profiles[pname] = {
+                            "cached_at": now_epoch,
+                            "data": res,
+                        }
+                    else:
+                        cached_profiles.pop(pname, None)
                 except Exception:
                     results_raw[pname] = {"status": "error", "error": "Codex profile query failed"}
+                    cached_profiles.pop(pname, None)
 
     clean_cache = {k: v for k, v in cached_profiles.items()
                    if k in profile_names or profile is not None}
@@ -1072,6 +1100,7 @@ def main():
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color output")
     parser.add_argument("--no-cache", "-f", "--refresh", action="store_true", help="Bypass quota cache and query fresh limits")
     parser.add_argument("--refresh-auth", action="store_true", help="Ask Codex to renew saved credentials once, bypassing the quota cache")
+    parser.add_argument("--timeout", type=int, default=12, help="Codex query timeout in seconds (default: 12)")
     parser.add_argument("--cache-ttl", type=int, default=60, help="Quota cache TTL in seconds (default: 60)")
     parser.add_argument("--diagnose", nargs=2, metavar=("CODEX_BIN", "PROFILE"), help="Diagnose auth failure for profile")
     parser.add_argument("--next", "--auto", dest="auto_rotate", action="store_true", help="Automatically switch to the profile with highest quota (or shortest reset time)")
@@ -1101,6 +1130,7 @@ def main():
     data = fetch_all_profiles_dashboard(
         args.home_dir,
         args.codex_bin,
+        timeout=args.timeout,
         no_cache=args.no_cache,
         cache_ttl=args.cache_ttl,
         refresh_auth=args.refresh_auth,
