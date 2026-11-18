@@ -11,6 +11,7 @@ Usage: codex-switch <profile>
        codex-switch next
        codex-switch auto
        codex-switch run [<profile>] [codex arguments...]
+       codex-switch resume [<profile>] [--search <text>] [--list | --json | --last]
        codex-switch add <profile>
        codex-switch login <profile> [codex login arguments...]
        codex-switch login <profile> --expect-domain <domain> [codex login arguments...]
@@ -42,7 +43,7 @@ function Stop-WithError([string] $Message, [int] $ExitCode = 1) {
 
 function Test-ValidProfileName([AllowNull()][AllowEmptyString()][string] $Name) {
     if ([string]::IsNullOrEmpty($Name) -or $Name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or $Name.EndsWith('.')) { return $false }
-    return @('add','auth','auto','current','dashboard','help','home','list','login','logout','next','remove','run','shell-init','status','switch') -notcontains $Name.ToLowerInvariant()
+    return @('add','auth','auto','current','dashboard','help','home','list','login','logout','next','remove','resume','run','shell-init','status','switch') -notcontains $Name.ToLowerInvariant()
 }
 
 function Assert-ProfileName([string] $Name) {
@@ -350,6 +351,26 @@ function Prepare-Profile([string] $Profile) {
     return $profileHome
 }
 
+function Test-SharedResumeArguments([string[]] $Arguments) {
+    if (-not $Arguments -or $Arguments[0] -ne 'resume') { return $false }
+    foreach ($argument in @($Arguments | Select-Object -Skip 1)) {
+        if ($argument -notin @('--all','--last')) { return $false }
+    }
+    return $true
+}
+
+function Invoke-SharedResume([string] $Profile, [string[]] $Arguments) {
+    $profileHome = Prepare-Profile $Profile
+    Assert-Auth (Join-Path $profileHome 'auth.json') $Profile
+    Assert-ExpectedDomain $profileHome (Join-Path $profileHome 'auth.json')
+    $helper = if ($env:CODEX_SWITCH_RESUME_HELPER) { $env:CODEX_SWITCH_RESUME_HELPER } else { Join-Path $PSScriptRoot 'codex-switch-resume.py' }
+    if (-not [IO.File]::Exists($helper)) { Stop-WithError "could not find shared conversation helper: $helper" }
+    $py = if ($env:CODEX_SWITCH_PYTHON) { $env:CODEX_SWITCH_PYTHON } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } elseif (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { Stop-WithError 'Python 3 is required for shared conversation search' }
+    $codexBinary = if ($env:CODEX_SWITCH_CODEX_BIN) { $env:CODEX_SWITCH_CODEX_BIN } else { 'codex' }
+    & $py $helper --active-home $script:ActiveHome --profile $Profile --codex-bin $codexBinary @Arguments
+    $script:LastCodexExitCode = $LASTEXITCODE
+}
+
 function Invoke-CodexAtHome([string] $CodexHome, [string[]] $Arguments, [switch] $NoDaemon, [switch] $DisableHooks) {
     $codex = if ($env:CODEX_SWITCH_CODEX_BIN) { $env:CODEX_SWITCH_CODEX_BIN } else { 'codex' }
     $codexCommand = Get-Command $codex -All -ErrorAction SilentlyContinue | Where-Object { $_.CommandType -in @('Application','ExternalScript') } | Select-Object -First 1
@@ -368,7 +389,9 @@ function Invoke-CodexAtHome([string] $CodexHome, [string[]] $Arguments, [switch]
         if ($NoDaemon) { $flags += '--no-daemon' }
         if ($DisableHooks) { $flags += @('--disable','hooks') }
         $global:LASTEXITCODE = 0
-        & $codexCommand.Source '-c' 'cli_auth_credentials_store="file"' @flags @Arguments
+        # Preserve deliberate cross-profile local resumes without changing
+        # creator metadata or the selected profile's credential store.
+        & $codexCommand.Source '-c' 'cli_auth_credentials_store="file"' '-c' 'features.cli_resume_account_check=false' @flags @Arguments
         $script:LastCodexExitCode = $LASTEXITCODE
     }
     finally {
@@ -496,12 +519,12 @@ try {
     } elseif (@('dashboard','home','next','auto') -contains $command) {
     } elseif ($command -eq 'status') {
         if ($arguments.Count -gt 2) { Stop-WithError 'status accepts at most one profile' 64 }
-    } elseif ($command -ne 'run') {
+    } elseif ($command -notin @('run','resume')) {
         if ($arguments.Count -ne 1) { Stop-WithError 'expected exactly one profile argument' 64 }
         $profile = $arguments[0]; Assert-ProfileName $profile; $command = 'switch'
     }
 
-    if (@('add','auth','login','logout','remove','run','status','switch') -contains $command) { Migrate-LegacyAuth }
+    if (@('add','auth','login','logout','remove','resume','run','status','switch') -contains $command) { Migrate-LegacyAuth }
     switch ($command) {
         'current' { if (-not $script:ActiveProfile) { Stop-WithError 'no active profile' }; $script:ActiveProfile; break }
         'shell-init' {
@@ -601,6 +624,16 @@ try {
             Invoke-Codex $profile @('login','status')
             exit $script:LastCodexExitCode
         }
+        'resume' {
+            $rest = @($arguments | Select-Object -Skip 1)
+            $profile = $script:ActiveProfile
+            if ($rest.Count -gt 0 -and (Test-ValidProfileName $rest[0]) -and [IO.Directory]::Exists("$($script:ActiveHome)-$($rest[0])")) {
+                $profile = $rest[0]; $rest = @($rest | Select-Object -Skip 1)
+            }
+            if (-not $profile) { Stop-WithError 'resume requires a profile when none is active' 64 }
+            Invoke-SharedResume $profile $rest
+            exit $script:LastCodexExitCode
+        }
         'run' {
             $rest = @($arguments | Select-Object -Skip 1)
             $explicitProfile = $false
@@ -615,6 +648,10 @@ try {
             if ($rest.Count -gt 0 -and $rest[0] -eq '--with-hooks') {
                 $env:CODEX_SWITCH_DISABLE_HOOKS = '0'
                 $rest = @($rest | Select-Object -Skip 1)
+            }
+            if (Test-SharedResumeArguments $rest) {
+                Invoke-SharedResume $profile @($rest | Select-Object -Skip 1)
+                exit $script:LastCodexExitCode
             }
             if ($explicitProfile) { Write-ActiveMarker $profile }
             Invoke-Codex $profile $rest -NoDaemon -DisableHooks:($env:CODEX_SWITCH_DISABLE_HOOKS -eq '1')

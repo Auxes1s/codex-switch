@@ -20,7 +20,7 @@ import time
 
 RESERVED_COMMANDS = {
     "add", "auth", "auto", "current", "dashboard", "help", "home",
-    "list", "login", "logout", "next", "remove", "run", "shell-init",
+    "list", "login", "logout", "next", "remove", "resume", "run", "shell-init",
     "status", "switch",
 }
 

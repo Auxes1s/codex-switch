@@ -23,7 +23,7 @@ DATABASES = (
 )
 RESERVED_PROFILES = {
     "add", "auth", "auto", "current", "dashboard", "help", "home", "list", "login", "logout", "next", "remove",
-    "run", "shell-init", "status", "switch",
+    "resume", "run", "shell-init", "status", "switch",
 }
 SKIP_TABLES = {"_sqlx_migrations", "sqlite_sequence", "backfill_state",
                "thread_history_projection_state",

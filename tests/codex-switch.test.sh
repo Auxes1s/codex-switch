@@ -111,8 +111,11 @@ assert_text_equals "$test_home/.codex" "$(sed -n '1p' "${capture_base}.sqlite-ho
 assert_text_equals 'absent' "$(sed -n '1p' "${capture_base}.auth-env")" 'run inherited an overriding auth variable'
 assert_arg '-c' 1 'run omitted the config override flag'
 assert_arg 'cli_auth_credentials_store="file"' 2 'run did not force file credential storage'
-assert_arg 'exec' 3 'run lost the Codex subcommand'
-assert_arg 'do the thing' 4 'run lost a Codex argument'
+assert_arg '-c' 3 'run omitted the resume override flag'
+assert_arg 'features.cli_resume_account_check=false' 4 'run did not preserve cross-profile resumes'
+assert_arg '--no-daemon' 5 'run did not isolate runtime authentication from the shared daemon'
+assert_arg 'exec' 6 'run lost the Codex subcommand'
+assert_arg 'do the thing' 7 'run lost a Codex argument'
 assert_text_equals 'work-refreshed' "$(sed -n '1p' "$test_home/.codex-work/auth.json")" 'Codex did not refresh the selected profile directly'
 assert_file_equals "$test_home/central-auth-original" "$test_home/.codex/auth.json" 'run changed central credentials'
 assert_file_equals "$test_home/personal-auth-original" "$test_home/.codex-personal/auth.json" 'run changed another profile'
@@ -124,22 +127,22 @@ capture_base="${test_root}/run-active"
 HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" \
     CODEX_SWITCH_CAPTURE="$capture_base" "$command_path" run -- review >/dev/null
 assert_text_equals "$test_home/.codex-work" "$(sed -n '1p' "${capture_base}.home")" 'active run used the wrong CODEX_HOME'
-assert_arg 'review' 3 'active run lost the Codex argument'
+assert_arg 'review' 6 'active run lost the Codex argument'
 
 capture_base="${test_root}/status"
 HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" \
     CODEX_SWITCH_CAPTURE="$capture_base" "$command_path" status personal >/dev/null
 assert_text_equals "$test_home/.codex-personal" "$(sed -n '1p' "${capture_base}.home")" 'status used the wrong CODEX_HOME'
-assert_arg 'login' 3 'status omitted the login subcommand'
-assert_arg 'status' 4 'status omitted the status subcommand'
+assert_arg 'login' 6 'status omitted the login subcommand'
+assert_arg 'status' 7 'status omitted the status subcommand'
 
 capture_base="${test_root}/login-new"
 HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" \
     CODEX_SWITCH_CAPTURE="$capture_base" CODEX_SWITCH_WRITE_AUTH='new-auth' \
     "$command_path" login new --device-auth >/dev/null
 assert_text_equals "$test_home/.codex-new" "$(sed -n '1p' "${capture_base}.home")" 'login used the wrong CODEX_HOME'
-assert_arg 'login' 3 'login omitted the Codex login subcommand'
-assert_arg '--device-auth' 4 'login lost its argument'
+assert_arg 'login' 6 'login omitted the Codex login subcommand'
+assert_arg '--device-auth' 7 'login lost its argument'
 assert_text_equals 'new-auth' "$(sed -n '1p' "$test_home/.codex-new/auth.json")" 'login did not store auth in the profile'
 mode=$(stat -c '%a' "$test_home/.codex-new/auth.json" 2>/dev/null || stat -f '%Lp' "$test_home/.codex-new/auth.json")
 assert_text_equals '600' "$mode" 'profile credentials do not have mode 600'
@@ -167,7 +170,7 @@ printf '%s\n' "$list_output" | grep -x 'personal' >/dev/null || fail 'list omitt
 capture_base="${test_root}/logout"
 HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" \
     CODEX_SWITCH_CAPTURE="$capture_base" "$command_path" logout personal >/dev/null
-assert_arg 'logout' 3 'logout omitted the Codex logout subcommand'
+assert_arg 'logout' 6 'logout omitted the Codex logout subcommand'
 
 HOME="$test_home" "$command_path" switch new >/dev/null
 printf '%s\n' 'preserve-me' > "$test_home/.codex-unsigned/notes.txt"
@@ -284,16 +287,43 @@ assert_text_equals '700' "$mode" 'existing profile directory permissions not rep
 mode=$(stat -c '%a' "$test_home/.codex-gig/auth.json" 2>/dev/null || stat -f '%Lp' "$test_home/.codex-gig/auth.json")
 assert_text_equals '600' "$mode" 'existing credential permissions not repaired'
 
+# Shared discovery intercepts only picker/last forms. Explicit IDs keep the
+# native launch path, and browsing another profile leaves selection unchanged.
+resume_stub="${test_root}/resume-helper.py"
+cat > "$resume_stub" <<'EOF'
+import json, os, sys
+print(json.dumps(sys.argv[1:]))
+EOF
+resume_marker=$(cat "$test_home/.codex/.codex-switch-active")
+resume_output=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" \
+    CODEX_SWITCH_RESUME_HELPER="$resume_stub" "$command_path" resume personal --search 'B10 bindings' --json)
+printf '%s\n' "$resume_output" | grep -F 'B10 bindings' >/dev/null || fail 'shared resume lost its search argument'
+assert_text_equals "$resume_marker" "$(cat "$test_home/.codex/.codex-switch-active")" 'shared search changed active selection'
+for picker_flag in '' '--all' '--last'; do
+    resume_output=$(HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" \
+        CODEX_SWITCH_RESUME_HELPER="$resume_stub" "$command_path" run personal resume $picker_flag)
+    printf '%s\n' "$resume_output" | grep -F -- '--profile' >/dev/null || fail 'ordinary resume bypassed shared discovery'
+    assert_text_equals "$resume_marker" "$(cat "$test_home/.codex/.codex-switch-active")" 'picker browsing changed active selection'
+done
+capture_base="${test_root}/explicit-resume"
+HOME="$test_home" CODEX_SWITCH_CODEX_BIN="$codex_stub" CODEX_SWITCH_CAPTURE="$capture_base" \
+    "$command_path" run personal resume 01a1d6f2-6db7-76b0-a8dc-0c68fdbea1bf >/dev/null
+assert_arg 'resume' 6 'explicit resume did not use the native command'
+assert_arg '01a1d6f2-6db7-76b0-a8dc-0c68fdbea1bf' 7 'explicit resume lost the conversation ID'
+assert_text_equals 'personal' "$(cat "$test_home/.codex/.codex-switch-active")" 'explicit resume did not select its profile'
+
 install_dir="${test_root}/installed/bin"
 CODEX_SWITCH_INSTALL_DIR="$install_dir" "$installer_path" >/dev/null
 assert_file_equals "$command_path" "$install_dir/codex-switch" 'installer copied different content'
 assert_file_equals "$repo_dir/bin/codex-switch-migrate.py" "$install_dir/codex-switch-migrate.py" 'installer omitted the migration helper'
 assert_file_equals "$repo_dir/bin/codex-switch-diagnose.py" "$install_dir/codex-switch-diagnose.py" 'installer omitted the diagnostic helper'
 assert_file_equals "$repo_dir/bin/codex-switch-dashboard.py" "$install_dir/codex-switch-dashboard.py" 'installer omitted the dashboard helper'
+assert_file_equals "$repo_dir/bin/codex-switch-resume.py" "$install_dir/codex-switch-resume.py" 'installer omitted the shared resume helper'
 [ -x "$install_dir/codex-switch" ] || fail 'installed command is not executable'
 
 python3 "$repo_dir/tests/migration.test.py"
 python3 "$repo_dir/tests/diagnostics.test.py"
 python3 "$repo_dir/tests/dashboard.test.py"
+python3 "$repo_dir/tests/resume.test.py"
 
 printf '%s\n' 'ok - all codex-switch tests passed'

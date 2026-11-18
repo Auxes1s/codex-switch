@@ -143,6 +143,7 @@ function global:codex { throw 'selected shell function instead of external Codex
     Assert-Equal $testHome (First-Line "$capture.sqlite-home") 'run used wrong CODEX_SQLITE_HOME'
     Assert-Equal 'work-refreshed' (First-Line (Join-Path "$testHome-work" 'auth.json')) 'selected profile was not refreshed'
     Assert-True ((Get-Content -LiteralPath "$capture.args") -contains '--no-daemon') 'run did not disable the shared daemon'
+    Assert-True ((Get-Content -LiteralPath "$capture.args") -contains 'features.cli_resume_account_check=false') 'run did not preserve cross-profile resumes'
     Assert-Equal 'False' ([IO.File]::ReadAllText("$capture.wif")) 'run passed workload-identity environment variables'
     Assert-True ((Get-Acl -LiteralPath (Join-Path "$testHome-work" 'auth.json')).AreAccessRulesProtected) 'refreshed credentials retained inherited ACLs'
     Assert-Equal 'personal-auth' (First-Line (Join-Path "$testHome-personal" 'auth.json')) 'run changed another profile'
@@ -263,10 +264,28 @@ function global:codex { throw 'selected shell function instead of external Codex
     Assert-Equal '0' ([string] $result.ExitCode) "redirected Windows dashboard failed: $($result.Stderr)"
     Assert-True ($result.Stdout -match 'work') 'redirected dashboard omitted the active profile'
 
+    $resumeHelper = Join-Path $root 'resume-helper.py'
+    Write-Text $resumeHelper 'import json, sys; print(json.dumps(sys.argv[1:]))'
+    $resumeMarker = First-Line (Join-Path $testHome '.codex-switch-active')
+    $result = Invoke-Switch $testHome @('resume','personal','--search','B10 bindings','--json') @{
+        CODEX_SWITCH_PYTHON = $python; CODEX_SWITCH_RESUME_HELPER = $resumeHelper; CODEX_SWITCH_CODEX_BIN = $stub
+    }
+    Assert-Equal '0' ([string] $result.ExitCode) "shared search failed: $($result.Stderr)"
+    Assert-True ($result.Stdout -match 'B10 bindings') 'shared search lost the title query'
+    Assert-Equal $resumeMarker (First-Line (Join-Path $testHome '.codex-switch-active')) 'shared search changed active selection'
+    foreach ($pickerArguments in @(@('run','personal','resume'), @('run','personal','resume','--all'), @('run','personal','resume','--last'))) {
+        $result = Invoke-Switch $testHome $pickerArguments @{
+            CODEX_SWITCH_PYTHON = $python; CODEX_SWITCH_RESUME_HELPER = $resumeHelper; CODEX_SWITCH_CODEX_BIN = $stub
+        }
+        Assert-Equal '0' ([string] $result.ExitCode) "ordinary resume failed: $($result.Stderr)"
+        Assert-True ($result.Stdout -match '--profile') 'ordinary resume bypassed shared search'
+        Assert-Equal $resumeMarker (First-Line (Join-Path $testHome '.codex-switch-active')) 'picker browsing changed active selection'
+    }
+
     $install = Join-Path $root 'installed\bin'
     $result = Invoke-Process $shell @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$installer,'-NoPathUpdate') @{ CODEX_SWITCH_INSTALL_DIR = $install }
     Assert-Equal '0' ([string] $result.ExitCode) 'installer failed'
-    foreach ($name in @('codex-switch.ps1', 'codex-switch.cmd', 'codex-switch-migrate.py', 'codex-switch-diagnose.py', 'codex-switch-dashboard.py')) {
+    foreach ($name in @('codex-switch.ps1', 'codex-switch.cmd', 'codex-switch-migrate.py', 'codex-switch-diagnose.py', 'codex-switch-dashboard.py', 'codex-switch-resume.py')) {
         Assert-True ([IO.File]::Exists((Join-Path $install $name))) "installer omitted $name"
     }
     $installedCommand = Join-Path $install 'codex-switch.cmd'

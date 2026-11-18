@@ -31,6 +31,9 @@ jobs:
       - name: Run profile dashboard tests
         shell: pwsh
         run: python ./tests/dashboard.test.py
+      - name: Run shared conversation tests
+        shell: pwsh
+        run: python ./tests/resume.test.py
       - name: Verify user PATH installation
         shell: powershell
         run: |

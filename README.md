@@ -3,7 +3,7 @@
 [![Test](https://github.com/Auxes1s/codex-switch/actions/workflows/test.yml/badge.svg)](https://github.com/Auxes1s/codex-switch/actions/workflows/test.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](https://github.com/Auxes1s/codex-switch)
 [![Shell](https://img.shields.io/badge/shell-bash%20%7C%20zsh%20%7C%20fish%20%7C%20pwsh-blueviolet)](https://github.com/Auxes1s/codex-switch)
-[![Codex Verified](https://img.shields.io/badge/Codex%20CLI-0.167.2-success)](https://learn.chatgpt.com/docs/auth)
+[![Codex Verified](https://img.shields.io/badge/Codex%20CLI-0.169.0-success)](https://learn.chatgpt.com/docs/auth)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > **Zero-token-copying profile manager and usage limits dashboard for OpenAI's Codex CLI.** Switch between personal, work, client, and side-gig ChatGPT accounts instantly—with shared session history, isolated credential caches, and an interactive rate limits dashboard & web homepage.
@@ -185,6 +185,49 @@ codex-switch list          # Lists all profiles with active/signed-out badges
 codex-switch status        # Verifies login status of the active profile
 codex-switch status work   # Verifies login status of a specific profile
 ```
+
+Search and resume saved local conversations from every profile:
+
+```sh
+codex-switch resume                         # Shared picker, using the active profile
+codex-switch resume work --search "B10"      # Find another profile's conversation
+codex-switch resume work --search "B10" --list
+codex-switch resume work --json             # Read-only, scriptable shared list
+codex-switch resume work --last             # Most recently updated shared conversation
+```
+
+The picker includes all project folders and profiles. Enter a result number to
+resume it, `/text` to search titles and project paths, `n`/`p` to change pages,
+or `q` to cancel. Searching, listing and cancelling preserve the active profile;
+selecting a conversation runs it under the chosen profile. Noninteractive
+invocations print the matching list without starting Codex unless `--last` or
+an explicit conversation UUID is supplied. Native resume options can follow
+`--`, for example `codex-switch resume work --search B10 -- --model <model>`.
+
+With shell integration enabled, `codex resume`, `codex resume --all` and
+`codex resume --last` also use this shared picker or shared latest selection.
+Explicit UUIDs continue to use Codex's native resume command:
+
+```sh
+codex-switch run personal resume <conversation-uuid>
+codex-switch run work resume <conversation-uuid>
+```
+
+Codex 0.169.0 [filters its native resume picker by the conversation's creator account](https://github.com/openai/codex/blob/rust-v0.169.0/codex-rs/tui/src/resume_picker.rs#L2563).
+In the unwrapped native command, `resume --all` removes only the working-directory
+filter. The codex-switch picker queries `thread/list` with `currentAccountOnly:
+false` and resumes the selected UUID, preserving creator metadata. The picker
+inside an already-running Codex session (`/resume`) and desktop/IDE pickers keep
+their native behavior. These changes apply to terminal launches through
+codex-switch; they do not patch the installed Codex application.
+
+The launcher sets `features.cli_resume_account_check=false` for its own launches
+so the [optional creator-account resume restriction](https://github.com/openai/codex/blob/rust-v0.169.0/codex-rs/app-server/src/request_processors/thread_resume_account.rs) cannot block this workflow.
+Creator metadata and transcript contents are preserved. POSIX launches also use
+`--no-daemon`, matching Windows profile runs, to keep runtime authentication in
+the selected profile's process. These settings apply to local saved history;
+cloud conversations and account-specific remote resources retain their service
+access requirements.
 
 ### Transparent Shell Integration
 
@@ -392,6 +435,7 @@ If Codex exits with a failure code, `codex-switch` launches a diagnostic query b
 | `codex-switch next` | Automatically switches to the profile with the highest quota (or shortest reset time). |
 | `codex-switch auto` | Alias for `next`. |
 | `codex-switch run [<profile>] [--] [args...]` | Runs Codex under `<profile>` (or active profile if omitted); an explicit profile also selects it as active. |
+| `codex-switch resume [<profile>] [--search <text>] [--list \| --json \| --last]` | Searches local conversations across profiles and resumes the selection under the chosen profile. |
 | `codex-switch login <profile> [args...]` | Authenticates `<profile>` via browser login flow. Automatically creates profile if missing. |
 | `codex-switch auth <profile> [args...]` | Alias for `login`. |
 | `codex-switch logout <profile>` | Signs out `<profile>` by invoking Codex logout. |
@@ -451,15 +495,19 @@ The installer copies launcher scripts to `%LOCALAPPDATA%\Programs\codex-switch\b
 
 ---
 
-## Compatibility check (12 November 2026)
+## Compatibility check (14 November 2026)
 
-Verified locally with Codex CLI **0.167.2**, matching npm `latest` at check time and the [official release notes](https://learn.chatgpt.com/docs/changelog). Live token renewal, `account/read`, and `account/rateLimits/read` succeeded for configured profiles without changing the active selection or desktop credentials. The generated 0.167.2 JSON schema confirms the initialization, proactive-refresh, multi-bucket rate limits (`rateLimitsByLimitId`), and new plan type parameters used here. These checks cover authentication and quota access; they do not make a model-generation request.
+Verified locally with Codex CLI **0.169.0**, released on 13 November in the [official release notes](https://github.com/openai/codex/releases/tag/rust-v0.169.0). Live `account/read` and `account/rateLimits/read` succeeded for all five configured profiles without changing the active selection or desktop credentials. Generated 0.169.0 JSON schemas confirm initialization, proactive-refresh, quota, and resume request shapes. The real-binary compatibility test verifies cross-account discovery, resume, and history loading for legacy and paginated conversations under three synthetic profiles, including when the new account check is enabled in shared configuration. It uses temporary homes and fake credentials, preserves creator metadata, and submits no model-generation request.
 
 The implementation follows the official [credential storage documentation](https://learn.chatgpt.com/docs/auth) and [app-server initialization protocol](https://learn.chatgpt.com/docs/app-server). Dashboard queries wait for initialization and account refresh before reading quota, scrub ambient auth variables, use bounded timeouts, and exclude incomplete checks from automatic rotation. Multi-bucket rate limits (`rateLimitsByLimitId`), nullable quota window durations, and backend spend-control blocks are handled. Failed or incomplete checks are never cached to avoid poisoning subsequent queries, and cached success is discarded when credentials are absent or unsafe, including after logout.
 
 POSIX launches reject symlinked profile homes and symlinked or hardlinked credentials. Dashboard checks reject linked or non-regular credential files before reading them, including when quota is cached; on POSIX they also verify ownership and enforce modes 700/600. Quota cache temporary files are created privately and published atomically. Credential files and environment files are excluded from Git by default. Credentials remain plaintext on disk in the documented file storage mode; shared sessions and configuration remain readable across profiles.
 
-Local POSIX and SQLite migration checks, 8 diagnostic tests, and 30 dashboard tests pass. Native Windows behavior remains covered by the CI configuration and was not executed on this Mac.
+Local POSIX and SQLite migration checks, 8 diagnostic tests, 30 dashboard tests, and 7 shared-conversation tests pass. Shared title search finds the same saved B10 conversation under all five live profiles without changing the active selection or credential files. Native Windows behavior remains covered by the CI configuration and was not executed on this Mac.
+
+The shell's default `codex` can differ from `CODEX_SWITCH_CODEX_BIN`. This check
+used `/opt/homebrew/bin/codex` (0.169.0); the older `~/.local/bin/codex` (0.155.0)
+was not selected by codex-switch.
 
 ## 🧪 Testing
 
@@ -471,6 +519,13 @@ Comprehensive test suites cover POSIX shell scripts, PowerShell scripts, SQLite 
 python3 ./tests/migration.test.py
 python3 ./tests/diagnostics.test.py
 python3 ./tests/dashboard.test.py
+python3 ./tests/resume.test.py
+```
+
+Optional compatibility check against an installed Codex binary (POSIX):
+
+```sh
+CODEX_SWITCH_TEST_CODEX_BIN=/absolute/path/to/codex python3 tests/codex-compatibility.test.py
 ```
 
 ### Windows Test Suite:
@@ -478,6 +533,7 @@ python3 ./tests/dashboard.test.py
 .\tests\codex-switch.test.ps1
 python .\tests\migration.test.py
 python .\tests\dashboard.test.py
+python .\tests\resume.test.py
 ```
 
 ---
